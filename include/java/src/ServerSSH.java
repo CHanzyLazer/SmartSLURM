@@ -137,7 +137,7 @@ public final class ServerSSH {
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
         // 递归子文件夹传输文件
         (new RecurseLocalDir(this, aDir) {
-            @Override public void initRemoteDir(String aRemoteDir) {mkdir_(tChannelSftp, aRemoteDir);}
+            @Override public boolean initRemoteDir(String aRemoteDir) {return mkdir_(tChannelSftp, aRemoteDir);}
             @Override public void doFile(File aLocalFile, String aRemoteDir) {try {tChannelSftp.put(aLocalFile.getPath(), aRemoteDir);} catch (SftpException ignored) {}}
         }).run();
         // 最后关闭通道
@@ -155,7 +155,7 @@ public final class ServerSSH {
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
         // 递归子文件夹传输文件
         (new RecurseRemoteDir(this, aDir, tChannelSftp){
-            @Override public void initLocalDir(String aLocalDir) {(new File(aLocalDir)).mkdirs();}
+            @Override public boolean initLocalDir(String aLocalDir) {File tFile = new File(aLocalDir); return tFile.isDirectory() || tFile.mkdirs();}
             @Override public void doFile(String aRemoteFile, String aLocalDir) {try {tChannelSftp.get(aRemoteFile, aLocalDir);} catch (SftpException ignored) {}}
         }).run();
         // 最后关闭通道
@@ -198,8 +198,8 @@ public final class ServerSSH {
         // 最后关闭通道
         tChannelSftp.disconnect();
     }
-    // 在远程服务器创建文件夹，支持跨文件夹创建文件夹
-    public void mkdir(String aDir) throws JSchException {
+    // 在远程服务器创建文件夹，支持跨文件夹创建文件夹。不同于一般的 mkdir，这里如果原本的目录存在会返回 true
+    public boolean mkdir(String aDir) throws JSchException {
         if (mDead) throw new RuntimeException("Can NOT mkdir from a Dead SSH.");
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
@@ -208,10 +208,44 @@ public final class ServerSSH {
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
+        String tRemoteDir = mRemoteWorkingDir+aDir;
         // 创建文件夹
-        mkdir_(tChannelSftp, mRemoteWorkingDir+aDir);
+        boolean tSuc = mkdir_(tChannelSftp, tRemoteDir);
         // 最后关闭通道
         tChannelSftp.disconnect();
+        return tSuc;
+    }
+    // 判断输入是否是远程服务器的文件夹
+    public boolean isDir(String aDir) throws JSchException {
+        if (mDead) throw new RuntimeException("Can NOT use isDir from a Dead SSH.");
+        // 会尝试一次重新连接
+        if (!isConnecting()) connect();
+        // 获取文件传输通道
+        ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        tChannelSftp.connect();
+        if (aDir.equals(".")) aDir = "";
+        if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
+        String tRemoteDir = mRemoteWorkingDir+aDir;
+        // 获取结果
+        boolean tOut = isDir_(tChannelSftp, tRemoteDir);
+        // 最后关闭通道
+        tChannelSftp.disconnect();
+        return tOut;
+    }
+    // 判断输入是否是远程服务器的文件
+    public boolean isFile(String aPath) throws JSchException {
+        if (mDead) throw new RuntimeException("Can NOT use isFile from a Dead SSH.");
+        // 会尝试一次重新连接
+        if (!isConnecting()) connect();
+        // 获取文件传输通道
+        ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        tChannelSftp.connect();
+        String tRemotePath = mRemoteWorkingDir+aPath;
+        // 获取结果
+        boolean tOut = isFile_(tChannelSftp, tRemotePath);
+        // 最后关闭通道
+        tChannelSftp.disconnect();
+        return tOut;
     }
     
     // 上传目录到服务器的并发版本，理论会更快
@@ -226,7 +260,7 @@ public final class ServerSSH {
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
         // 递归子文件夹传输文件
         (new RecurseLocalDir(this, aDir) {
-            @Override public void initRemoteDir(String aRemoteDir) {mkdir_(tChannelSftp, aRemoteDir);}
+            @Override public boolean initRemoteDir(String aRemoteDir) {return mkdir_(tChannelSftp, aRemoteDir);}
             @Override public void doFile(File aLocalFile, String aRemoteDir) {tSftpPool.submit(aChannelSftp -> {try {aChannelSftp.put(aLocalFile.getPath(), aRemoteDir);} catch (SftpException ignored) {}});}
         }).run();
         // 最后关闭通道
@@ -246,7 +280,7 @@ public final class ServerSSH {
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
         // 递归子文件夹传输文件
         (new RecurseRemoteDir(this, aDir, tChannelSftp){
-            @Override public void initLocalDir(String aLocalDir) {(new File(aLocalDir)).mkdirs();}
+            @Override public boolean initLocalDir(String aLocalDir) {File tFile = new File(aLocalDir); return tFile.isDirectory() || tFile.mkdirs();}
             @Override public void doFile(String aRemoteFile, String aLocalDir) {tSftpPool.submit(aChannelSftp -> {try {aChannelSftp.get(aRemoteFile, aLocalDir);} catch (SftpException ignored) {}});}
         }).run();
         // 最后关闭通道
@@ -265,7 +299,7 @@ public final class ServerSSH {
         tChannelSftp.connect();
         // 递归子文件夹传输文件
         (new RecurseLocalDir(this, "") {
-            @Override public void initRemoteDir(String aRemoteDir) {mkdir_(tChannelSftp, aRemoteDir);}
+            @Override public boolean initRemoteDir(String aRemoteDir) {return mkdir_(tChannelSftp, aRemoteDir);}
             @Override public void doFile(File aLocalFile, String aRemoteDir) {tSftpPool.submit(aChannelSftp -> {try {aChannelSftp.put(aLocalFile.getPath(), aRemoteDir);} catch (SftpException ignored) {}});}
             @Override public boolean dirFilter(String aLocalDirName) {return !aLocalDirName.startsWith(".") && !aLocalDirName.startsWith("_");}
             @Override public boolean fileFilter(String aLocalFileName) {return !aLocalFileName.startsWith(".") && !aLocalFileName.startsWith("_");}
@@ -286,7 +320,7 @@ public final class ServerSSH {
         tChannelSftp.connect();
         // 递归子文件夹传输文件
         (new RecurseRemoteDir(this, "", tChannelSftp) {
-            @Override public void initLocalDir(String aLocalDir) {(new File(aLocalDir)).mkdirs();}
+            @Override public boolean initLocalDir(String aLocalDir) {File tFile = new File(aLocalDir); return tFile.isDirectory() || tFile.mkdirs();}
             @Override public void doFile(String aRemoteFile, String aLocalDir) {tSftpPool.submit(aChannelSftp -> {try {aChannelSftp.get(aRemoteFile, aLocalDir);} catch (SftpException ignored) {}});}
             @Override public boolean dirFilter(String aRemoteDirName) {return !aRemoteDirName.startsWith(".") && !aRemoteDirName.startsWith("_");}
             @Override public boolean fileFilter(String aRemoteFileName) {return !aRemoteFileName.startsWith(".") && !aRemoteFileName.startsWith("_");}
@@ -330,23 +364,25 @@ public final class ServerSSH {
         return tAttrs != null && tAttrs.isDir();
     }
     // 判断是否是文件，无论是什么情况报错都返回 false
-    static boolean isFile_(ChannelSftp aChannelSftp, String aDir) {
+    static boolean isFile_(ChannelSftp aChannelSftp, String aPath) {
         SftpATTRS tAttrs = null;
-        try {tAttrs = aChannelSftp.stat(aDir);} catch (SftpException ignored) {}
+        try {tAttrs = aChannelSftp.stat(aPath);} catch (SftpException ignored) {}
         return tAttrs != null && !tAttrs.isDir();
     }
-    // 在远程服务器创建文件夹，实现跨文件夹创建文件夹
-    static void mkdir_(ChannelSftp aChannelSftp, String aDir) {
-        if (isDir_(aChannelSftp, aDir)) return;
+    // 在远程服务器创建文件夹，实现跨文件夹创建文件夹。不同于一般的 mkdir，这里如果原本的目录存在会返回 true（主要是为了编程和使用的方便）
+    static boolean mkdir_(ChannelSftp aChannelSftp, String aDir) {
+        if (isDir_(aChannelSftp, aDir)) return true;
         // 如果目录不存在，则需要创建目录
+        boolean tSuc = true;
         int tEndIdx = aDir.lastIndexOf("/", aDir.length()-2);
         if (tEndIdx > 0) {
             String tParent = aDir.substring(0, tEndIdx+1);
             // 递归创建上级目录
-            mkdir_(aChannelSftp, tParent);
+            tSuc = mkdir_(aChannelSftp, tParent);
         }
         // 创建当前目录
-        try {aChannelSftp.mkdir(aDir);} catch (SftpException ignored) {}
+        try {aChannelSftp.mkdir(aDir);} catch (SftpException e) {return false;}
+        return tSuc;
     }
     // 内部实用类，递归的对本地文件夹进行操作，会同时记录对应的远程目录，减少重复代码
     static class RecurseLocalDir implements Runnable {
@@ -362,8 +398,7 @@ public final class ServerSSH {
         private void doDir(File aLocalDir, String aRemoteDir) {
             File[] tLocalFiles = aLocalDir.listFiles();
             if (tLocalFiles == null) return;
-            initRemoteDir(aRemoteDir);
-            for (File tFile : tLocalFiles) {
+            if (initRemoteDir(aRemoteDir)) for (File tFile : tLocalFiles) {
                 if (tFile.isDirectory()) {if (dirFilter(tFile.getName()))  doDir(tFile, aRemoteDir+tFile.getName()+"/");}
                 else if (tFile.isFile()) {if (fileFilter(tFile.getName())) doFile(tFile, aRemoteDir);}
             }
@@ -371,7 +406,7 @@ public final class ServerSSH {
         }
         
         // stuff to override
-        public void initRemoteDir(String aRemoteDir) {/**/} // 开始遍历本地文件夹之前初始化对应的远程文件夹
+        public boolean initRemoteDir(String aRemoteDir) {return true;} // 开始遍历本地文件夹之前初始化对应的远程文件夹，返回 false 则表示此远程文件夹初始失败，不会进行后续的遍历此文件夹操作
         public void doFile(File aLocalFile, String aRemoteDir) {/**/} // 对于此本地文件夹内的文件进行操作
         public void doDirFinal(File aLocalDir, String aRemoteDir) {/**/} // 最后对此本地文件夹进行操作
         public boolean dirFilter(String aLocalDirName) {return true;} // 文件夹过滤器，返回 true 才会执行后续操作
@@ -394,8 +429,7 @@ public final class ServerSSH {
             Vector<ChannelSftp.LsEntry> tRemoteFiles = null;
             try {tRemoteFiles = mChannelSftp.ls(aRemoteDir);} catch (SftpException ignored) {}
             if (tRemoteFiles == null) return;
-            initLocalDir(aLocalDir);
-            for (ChannelSftp.LsEntry tFile : tRemoteFiles) {
+            if (initLocalDir(aLocalDir)) for (ChannelSftp.LsEntry tFile : tRemoteFiles) {
                 if (tFile.getFilename().equals(".") || tFile.getFilename().equals("..")) continue;
                 if (tFile.getAttrs().isDir()) {if (dirFilter(tFile.getFilename())) doDir(aRemoteDir+tFile.getFilename()+"/", aLocalDir+tFile.getFilename()+"/");}
                 else {if (fileFilter(tFile.getFilename())) doFile(aRemoteDir+tFile.getFilename(), aLocalDir);}
@@ -404,7 +438,7 @@ public final class ServerSSH {
         }
     
         // stuff to override
-        public void initLocalDir(String aLocalDir) {/**/} // 开始遍历远程文件夹之前初始化对应的本地文件夹
+        public boolean initLocalDir(String aLocalDir) {return true;} // 开始遍历远程文件夹之前初始化对应的本地文件夹，返回 false 则表示此本地文件夹初始失败，不会进行后续的遍历此文件夹操作
         public void doFile(String aRemoteFile, String aLocalDir) {/**/} // 对于此远程文件夹内的文件进行操作
         public void doDirFinal(String aRemoteDir, String aLocalDir) {/**/} // 最后对此远程文件夹进行操作
         public boolean dirFilter(String aRemoteDirName) {return true;} // 文件夹过滤器，返回 true 才会执行后续操作

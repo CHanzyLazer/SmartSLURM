@@ -5,6 +5,7 @@ import com.jcraft.jsch.SftpException;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -22,7 +23,7 @@ public final class ServerSLURM {
     private final int mMaxJobNumber;
     
     private final Set<Integer> mJobIDList = new LinkedHashSet<>();
-    private final LinkedList<String> mCommandList = new LinkedList<>();
+    private final LinkedList<Pair<Callable<Boolean>, String>> mCommandList = new LinkedList<>();
     private final ExecutorService mPool;
     private boolean mDead = false;
     
@@ -70,9 +71,11 @@ public final class ServerSLURM {
             boolean tIsJobEmpty;
             synchronized(mJobIDList) {tIsJobEmpty = mJobIDList.isEmpty();}
             if (tIsCoCommandEmpty && tIsJobEmpty) {if (mDead) break; else continue;}
+            // 这里统一检查一次联机状态，如果重新连接失败直接跳过重试
+            if (!mSSH.isConnecting()) try {mSSH.connect();} catch (JSchException e) {continue;}
             // 首先获取正在执行的任务队列
             Set<Integer> tJobIDs = null;
-            try {tJobIDs = jobIDs();} catch (JSchException | IOException ignored) {}
+            try {tJobIDs = jobIDs_();} catch (JSchException | IOException ignored) {}
             // 获取失败则直接跳过重试
             if (tJobIDs == null) continue;
             // 首先更新正在执行的任务列表
@@ -85,34 +88,40 @@ public final class ServerSLURM {
             // 如果正在执行的任务列表超过限制，则不会提交
             if (tJobIDs.size() >= mMaxJobNumber) continue;
             // 获取任务
-            String tCommand;
+            Pair<Callable<Boolean>, String> tCommand;
             synchronized (mCommandList) {tCommand = mCommandList.pollFirst();}
+            if (tCommand == null) continue;
             // 提交任务
-            int tJobID = -1;
-            try {tJobID = submitSbatch_(tCommand);} catch (JSchException | IOException ignored) {}
+            Callable<Boolean> tBeforeSystem = tCommand.first;
+            if (tBeforeSystem != null) {
+                boolean tSuc;
+                try {tSuc = tBeforeSystem.call();} catch (Exception e) {continue;}
+                if (!tSuc) continue;
+            }
+            ChannelExec tChannelExec;
+            try {tChannelExec = mSSH.systemChannel(tCommand.second);} catch (JSchException e) {continue;}
+            int tJobID = getJobIDFromChannel_(tChannelExec);
             if (tJobID > 0) synchronized(mJobIDList) {mJobIDList.add(tJobID);}
         }
         // 最后关闭 SSH 通道
         mSSH.shutdown();
     }
     
-    // 内部的提交任务接口，必须是 sbatch 的指令从而能够获取进程号，返回 -1 表示提交失败
-    int submitSbatch_(String aSbatchCommand) throws JSchException, IOException {
-        if (mDead) throw new RuntimeException("Can NOT submitSbatch from a Dead SLURM.");
-        if (aSbatchCommand == null) return -1;
-        // systemChannel 内部已经尝试了重连
-        ChannelExec tChannelExec = mSSH.systemChannel(aSbatchCommand);
-        // 获取输出从而得到任务号
-        InputStream tIn = tChannelExec.getInputStream();
-        tChannelExec.connect();
+    // 从 aChannelExec 中获取任务号，返回小于零的值表示获取失败。会在内部开启通道来获得输出，因此获取完成后会直接关闭通道
+    static int getJobIDFromChannel_(ChannelExec aChannelExec) {
+        InputStream tIn;
+        try {tIn = aChannelExec.getInputStream();} catch (IOException e) {return -1;}
+        // 开启通道获取输出
+        try {aChannelExec.connect();} catch (JSchException e) {return -2;}
         BufferedReader tReader = new BufferedReader(new InputStreamReader(tIn));
-        String tLine = tReader.readLine(); // 只需要读取一行
-        tReader.close();
-        // 最后关闭通道
-        tChannelExec.disconnect();
+        String tLine;
+        try {tLine = tReader.readLine();} catch (IOException e) {return -3;} // 只需要读取一行
+        try {tReader.close();} catch (IOException e) {return -4;}
+        // 会在内部关闭通道
+        aChannelExec.disconnect();
         // 返回任务号
         if (tLine != null && tLine.startsWith("Submitted batch job ")) return Integer.parseInt(tLine.substring(20));
-        return -1;
+        return -5;
     }
     
     /**
@@ -121,17 +130,31 @@ public final class ServerSLURM {
      * 一般来说需要在指令中自己使用 srun 来开始并行任务
      * 可以指定输出目录
      */
-    public void submitSystem(String aCommand) throws JSchException {submitSystem(aCommand, "work");}
-    public void submitSystem(String aCommand, int aNodeNumber) throws JSchException {submitSystem(aCommand, "work", aNodeNumber);}
+    public void submitSystem(String aCommand) {submitSystem(aCommand, "work");}
+    public void submitSystem(String aCommand, int aNodeNumber) {submitSystem(aCommand, "work", aNodeNumber);}
     public void submitSystem(String aCommand, int aNodeNumber, String aOutputPath) {submitSystem(aCommand, "work", aNodeNumber, aOutputPath);}
-    public void submitSystem(String aCommand, String aPartition) throws JSchException {submitSystem(aCommand, aPartition, 1);}
-    public void submitSystem(String aCommand, String aPartition, int aNodeNumber) throws JSchException {if (mDead) throw new RuntimeException("Can NOT submitSbatch from a Dead SLURM."); mSSH.mkdir(".temp/slurm"); submitSystem(aCommand, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
-    public void submitSystem(String aCommand, String aPartition, int aNodeNumber, String aOutputPath) {
+    public void submitSystem(String aCommand, String aPartition) {submitSystem(aCommand, aPartition, 1);}
+    public void submitSystem(String aCommand, String aPartition, int aNodeNumber) {submitSystem(aCommand, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
+    public void submitSystem(String aCommand, String aPartition, int aNodeNumber, String aOutputPath) {submitSystem(null, aCommand, aPartition, aNodeNumber, aOutputPath);}
+    public void submitSystem(Callable<Boolean> aBeforeSystem, String aCommand, String aPartition, int aNodeNumber, String aOutputPath) {
         if (mDead) throw new RuntimeException("Can NOT submitSbatch from a Dead SLURM.");
+        // 需要创建输出目录的文件夹
+        int tEndIdx = aOutputPath.lastIndexOf("/");
+        if (tEndIdx > 0) { // 否则不用创建，认为 mRemoteWorkingDir 已经存在
+            final String tOutputDir = aOutputPath.substring(0, tEndIdx+1);
+            final Callable<Boolean> tMkdirOutput = () -> mSSH.mkdir(tOutputDir);
+            // 如果 aBeforeSystem 为空则替换，不为空则将其附加在 BeforeSystem 之后
+            if (aBeforeSystem == null) {
+                aBeforeSystem = tMkdirOutput;
+            } else {
+                final Callable<Boolean> tBeforeSystem = aBeforeSystem;
+                aBeforeSystem = () -> tBeforeSystem.call() && tMkdirOutput.call();
+            }
+        }
         // 组装指令
         aCommand = String.format("echo -e '#!/bin/bash\\n%s' | sbatch --partition %s --nodes %d --output %s", aCommand, aPartition, aNodeNumber, aOutputPath);
         // 添加指令到队列
-        synchronized (mCommandList) {mCommandList.addLast(aCommand);}
+        synchronized (mCommandList) {mCommandList.addLast(new Pair<>(aBeforeSystem, aCommand));}
     }
     
     /**
@@ -139,15 +162,16 @@ public final class ServerSLURM {
      * 输入具体的指令，分区，任务数目（并行数目），每节点的最多任务数（用于计算节点数目）
      * 可以指定输出目录
      */
-    public void submitSrun(String aCommand) throws JSchException {submitSrun(aCommand, "work");}
-    public void submitSrun(String aCommand, int aTaskNumber) throws JSchException {submitSrun(aCommand, "work", aTaskNumber);}
-    public void submitSrun(String aCommand, int aTaskNumber, int aMaxTaskNumberPerNode) throws JSchException {submitSrun(aCommand, "work", aTaskNumber, aMaxTaskNumberPerNode);}
+    public void submitSrun(String aCommand) {submitSrun(aCommand, "work");}
+    public void submitSrun(String aCommand, int aTaskNumber) {submitSrun(aCommand, "work", aTaskNumber);}
+    public void submitSrun(String aCommand, int aTaskNumber, int aMaxTaskNumberPerNode) {submitSrun(aCommand, "work", aTaskNumber, aMaxTaskNumberPerNode);}
     public void submitSrun(String aCommand, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {submitSrun(aCommand, "work", aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
-    public void submitSrun(String aCommand, String aPartition) throws JSchException {submitSrun(aCommand, aPartition, 1);}
-    public void submitSrun(String aCommand, String aPartition, int aTaskNumber) throws JSchException {submitSrun(aCommand, aPartition, aTaskNumber, 20);}
-    public void submitSrun(String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode) throws JSchException {if (mDead) throw new RuntimeException("Can NOT submitSbatch from a Dead SLURM."); mSSH.mkdir(".temp/slurm"); submitSrun(aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
-    public void submitSrun(String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {
-        submitSystem(String.format("srun --ntasks %d --ntasks-per-node %d %s", aTaskNumber, aMaxTaskNumberPerNode, aCommand), aPartition, (int)Math.ceil(aTaskNumber/(double)aMaxTaskNumberPerNode), aOutputPath);
+    public void submitSrun(String aCommand, String aPartition) {submitSrun(aCommand, aPartition, 1);}
+    public void submitSrun(String aCommand, String aPartition, int aTaskNumber) {submitSrun(aCommand, aPartition, aTaskNumber, 20);}
+    public void submitSrun(String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode) {submitSrun(aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    public void submitSrun(String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {submitSrun(null, aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    public void submitSrun(Callable<Boolean> aBeforeSystem, String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {
+        submitSystem(aBeforeSystem, String.format("srun --ntasks %d --ntasks-per-node %d %s", aTaskNumber, aMaxTaskNumberPerNode, aCommand), aPartition, (int)Math.ceil(aTaskNumber/(double)aMaxTaskNumberPerNode), aOutputPath);
     }
     
     /**
@@ -155,45 +179,48 @@ public final class ServerSLURM {
      * 输入本地的脚本路径，首先会将其上传到服务器对应位置
      * 主要是个人用途，需要使用脚本来突破同时进行的任务数目
      */
-    public void submitSrunBash(String aBashPath) throws JSchException {submitSrunBash(aBashPath, "work");}
-    public void submitSrunBash(String aBashPath, int aTaskNumber) throws JSchException {submitSrunBash(aBashPath, "work", aTaskNumber);}
-    public void submitSrunBash(String aBashPath, int aTaskNumber, int aMaxTaskNumberPerNode) throws JSchException {submitSrunBash(aBashPath, "work", aTaskNumber, aMaxTaskNumberPerNode);}
-    public void submitSrunBash(String aBashPath, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) throws JSchException {submitSrunBash(aBashPath, "work", aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
-    public void submitSrunBash(String aBashPath, String aPartition) throws JSchException {submitSrunBash(aBashPath, aPartition, 1);}
-    public void submitSrunBash(String aBashPath, String aPartition, int aTaskNumber) throws JSchException {submitSrunBash(aBashPath, aPartition, aTaskNumber, 20);}
-    public void submitSrunBash(String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode) throws JSchException {if (mDead) throw new RuntimeException("Can NOT submitSbatch from a Dead SLURM."); mSSH.mkdir(".temp/slurm"); submitSrunBash(aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
-    public void submitSrunBash(String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) throws JSchException {
+    public void submitSrunBash(String aBashPath) {submitSrunBash(aBashPath, "work");}
+    public void submitSrunBash(String aBashPath, int aTaskNumber) {submitSrunBash(aBashPath, "work", aTaskNumber);}
+    public void submitSrunBash(String aBashPath, int aTaskNumber, int aMaxTaskNumberPerNode) {submitSrunBash(aBashPath, "work", aTaskNumber, aMaxTaskNumberPerNode);}
+    public void submitSrunBash(String aBashPath, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {submitSrunBash(aBashPath, "work", aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    public void submitSrunBash(String aBashPath, String aPartition) {submitSrunBash(aBashPath, aPartition, 1);}
+    public void submitSrunBash(String aBashPath, String aPartition, int aTaskNumber) {submitSrunBash(aBashPath, aPartition, aTaskNumber, 20);}
+    public void submitSrunBash(String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode) {submitSrunBash(aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    public void submitSrunBash(final String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {
         if (mDead) throw new RuntimeException("Can NOT submitSbatch from a Dead SLURM.");
         // 先上传脚本
-        // 会尝试一次重新连接
-        if (!mSSH.isConnecting()) mSSH.connect();
-        // 获取文件传输通道
-        ChannelSftp tChannelSftp = (ChannelSftp) mSSH.mSession.openChannel("sftp");
-        tChannelSftp.connect();
-        // 检测文件路径是否合法
-        File tLocalFile = new File(mSSH.mLocalWorkingDir+aBashPath);
-        if (!tLocalFile.isFile()) {System.out.println("Invalid Bash Path: "+aBashPath); return;}
-        // 创建目标文件夹
-        String tRemoteDir = mSSH.mRemoteWorkingDir;
-        int tEndIdx = aBashPath.lastIndexOf("/");
-        if (tEndIdx > 0) {
-            tRemoteDir += aBashPath.substring(0, tEndIdx+1);
-            ServerSSH.mkdir_(tChannelSftp, tRemoteDir); // 否则不用上传，认为 mRemoteWorkingDir 已经存在
-        }
-        // 上传脚本
-        try {tChannelSftp.put(tLocalFile.getPath(), tRemoteDir);} catch (SftpException e) {return;}
-        // 最后关闭通道
-        tChannelSftp.disconnect();
+        Callable<Boolean> tUploadBash = () -> {
+            // 会尝试一次重新连接
+            if (!mSSH.isConnecting()) mSSH.connect();
+            // 获取文件传输通道
+            ChannelSftp tChannelSftp = (ChannelSftp) mSSH.mSession.openChannel("sftp");
+            tChannelSftp.connect();
+            // 检测文件路径是否合法
+            File tLocalFile = new File(mSSH.mLocalWorkingDir+aBashPath);
+            if (!tLocalFile.isFile()) {System.out.println("Invalid Bash Path: "+aBashPath); return false;}
+            // 创建目标文件夹
+            String tRemoteDir = mSSH.mRemoteWorkingDir;
+            int tEndIdx = aBashPath.lastIndexOf("/");
+            if (tEndIdx > 0) { // 否则不用创建，认为 mRemoteWorkingDir 已经存在
+                tRemoteDir += aBashPath.substring(0, tEndIdx+1);
+                if (!ServerSSH.isDir_(tChannelSftp, tRemoteDir) && !ServerSSH.mkdir_(tChannelSftp, tRemoteDir)) return false;
+            }
+            // 上传脚本
+            tChannelSftp.put(tLocalFile.getPath(), tRemoteDir);
+            // 最后关闭通道
+            tChannelSftp.disconnect();
+            return true;
+        };
         // 提交命令
-        submitSrun(String.format("bash %s", aBashPath), aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);
+        submitSrun(tUploadBash, String.format("bash %s", aBashPath), aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);
     }
     
     
     // 获取这个用户正在执行的任务，和这个类本身无关
     public int jobNumber() throws JSchException, IOException {if (mDead) throw new RuntimeException("Can NOT get jobNumber from a Dead SLURM."); return jobIDs().size();}
     // 获取这个用户正在执行的任务 ID 的列表
-    public Set<Integer> jobIDs() throws JSchException, IOException {
-        if (mDead) throw new RuntimeException("Can NOT get jobIDs from a Dead SLURM.");
+    public Set<Integer> jobIDs() throws JSchException, IOException {if (mDead) throw new RuntimeException("Can NOT get jobIDs from a Dead SLURM."); return jobIDs_();}
+    Set<Integer> jobIDs_() throws JSchException, IOException {
         // 组装指令
         String tCommand = String.format("squeue --noheader --user %s --format %%i", mSSH.mSession.getUserName());
         // systemChannel 内部已经尝试了重连
@@ -234,8 +261,8 @@ public final class ServerSLURM {
     }
     
     // 撤销上一步提交的任务（如果已经交上去则会失败）
-    public String undo() {
-        String tCommand;
+    public Pair<Callable<Boolean>, String> undo() {
+        Pair<Callable<Boolean>, String> tCommand;
         synchronized (mCommandList) {tCommand = mCommandList.pollLast();}
         return tCommand;
     }
