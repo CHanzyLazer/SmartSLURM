@@ -1,10 +1,12 @@
 import com.jcraft.jsch.ChannelExec;
 import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.JSchException;
-import com.jcraft.jsch.SftpException;
 
 import java.io.*;
-import java.util.*;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -274,6 +276,22 @@ public final class ServerSLURM {
     public int getTaskNumber() {return getActiveCount() + getQueueSize();}
     
     public boolean awaitTermination() throws InterruptedException {return mPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);}
-    public int[] getActiveJobIDs() {int[] tJobIDs; synchronized(mJobIDList) {tJobIDs = mJobIDList.stream().mapToInt(Integer::intValue).toArray();} return tJobIDs;}
-    public String[] getQueueCommands() {String[] tCommands; synchronized(mCommandList) {tCommands = mCommandList.toArray(new String[0]);} return tCommands;}
+    public int[] getActiveJobIDs() {
+        int[] tJobIDs;
+        synchronized(mJobIDList) {
+            tJobIDs = new int[mJobIDList.size()];
+            int i = 0;
+            for (int tJobID : mJobIDList) {tJobIDs[i] = tJobID; ++i;}
+        }
+        return tJobIDs;
+    }
+    public String[] getQueueCommands() {
+        String[] tCommands;
+        synchronized(mCommandList) {
+            tCommands = new String[mCommandList.size()];
+            int i = 0;
+            for (Pair<Callable<Boolean>, String> tPair : mCommandList) {tCommands[i] = tPair.second; ++i;}
+        }
+        return tCommands;
+    }
 }

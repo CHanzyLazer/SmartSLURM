@@ -1,3 +1,5 @@
+**Switch to [English](README-en.md)**
+
 # SmartSLURM
 能使你像使用本地应用一样方便的管理 SLURM 服务器
 
@@ -11,8 +13,8 @@
 [demo.m](demo.m) 作为 matlab 使用的基本例子，[demo.ipynb](demo.ipynb) 作为在 python 中使用的基本例子
 
 # 使用方法
-从 [Release](https://github.com/CHanzyLazer/SmartSLURM/releases/tag/v1.1) 中下载， 
-`SmartSLURM-with-demo.zip` 包含了可以运行的使用例子，`SmartSLURM.jar` 则只包含 jar 包
+从 [Release](https://github.com/CHanzyLazer/SmartSLURM/releases/tag/v1.2) 中下载， 
+`SmartSLURM-with-demo.zip` 包含了可以运行的使用例子，`smartSLURM.jar` 则只包含 jar 包
 
 在 matlab 中，首先需要导入 java 类，在使用例子中 jar 包位于 include 目录下：
 ```matlab
