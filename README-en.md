@@ -15,7 +15,7 @@ This program does not require any third-party libraries so it can be used direct
 [demo.ipynb](demo.ipynb) provides a basic example for use in Python.
 
 # Usage
-Download from [Release](https://github.com/CHanzyLazer/SmartSLURM/releases/tag/v1.2). 
+Download from [Release](https://github.com/CHanzyLazer/SmartSLURM/releases/latest). 
 `SmartSLURM-with-demo.zip` contains runnable examples, and `smartSLURM.jar` is the jar package only.
 
 In Matlab, you need to import the java classes first. 

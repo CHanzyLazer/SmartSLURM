@@ -9,6 +9,7 @@ SSH_PASSWORD = 'password';
 SERVER_PROJECT_PATH = '~/test-smartSLURM';
 
 %% SSH PART
+import com.chanzy.*
 % init ssh, local project path and remote project path is needed
 ssh = ServerSSH.get(cd, SERVER_PROJECT_PATH, SSH_USER, SSH_IP, SSH_PASSWORD);
 % put all of this project dir to the server (will exclude file and dir which begin with '.' or '_')
@@ -39,6 +40,7 @@ pool.shutdown();
 ssh.shutdown();
 
 %% SLURM PART
+import com.chanzy.*
 % init slurm, max job number, local project path and remote project path is needed
 slurm = ServerSLURM.get(4, cd, SERVER_PROJECT_PATH, SSH_USER, SSH_IP, SSH_PASSWORD);
 % you can get the ssh of this and use the ssh methods before
