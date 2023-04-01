@@ -5,6 +5,7 @@ import com.jcraft.jsch.JSchException;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
+import org.json.simple.parser.ParseException;
 
 import java.io.*;
 import java.util.*;
@@ -32,12 +33,47 @@ public final class ServerSLURM {
     private final LinkedList<Pair<Pair<Task, Task>, String>> mCommandList = new LinkedList<>(); // <<beforeTask, afterTask>, command>
     private final ExecutorService mPool;
     private boolean mDead = false;
+    private boolean mPause = false; // 可以暂停任务的提交
+    private boolean mKilled = false; // 直接强制杀死提交进程
+    private boolean mSubmitting = false; // 记录是否正在提交
+    private boolean mNeedSaveMirror = false;
     
     private long mSleepTime = 500; // ms 设置更高的值可以降低检测的频率
     // 各种提交任务的尝试次数类
     private final TolerantCounter mTolerantCounter = new TolerantCounter();
     // 保存提交的任务名称，不一定和真实的类名匹配（如果是 load 得到的）
     private String mJobName = "JOB-FROM-"+this;
+    // 本地的镜像存储地址，会在任何修改后保存到此镜像
+    private String mMirrorPath = null;
+    
+    /// hooks, 修改这个来实现重写，我也不知道这个方法是不是合理
+    // 发生内部参数改变都需要调用一下这个函数
+    Runnable doMemberChange = () -> {if (mMirrorPath != null) mNeedSaveMirror = true;};
+    // 内部使用的保存到镜像的方法
+    void saveToMirror_() {
+        if (!mNeedSaveMirror) return;
+        // 保存之前先检测 mirror 是否还是自己的，如果不是则需要 kill（但是这个改动已经发生，这是不可避免的）
+        boolean tMirrorValid = false;
+        try (FileReader tFile = new FileReader(mMirrorPath)) {
+            JSONObject tJson = (JSONObject) new JSONParser().parse(tFile);
+            tMirrorValid = ((JSONObject) tJson.get("SLURM")).get("MirrorOwner").equals(this.toString());
+        } catch (IOException | ParseException ignored) {}
+        if (!tMirrorValid) {
+            System.out.printf("WARNING: Exist redundant instance of mirror(%s),\n", this);
+            System.out.println("  which has been killed, but may still have some redundant submit,");
+            System.out.println("  you need to kill the old instance before load the mirror.");
+            System.out.flush();
+            mNeedSaveMirror = false;
+            kill();
+            return;
+        }
+        // 开始保存镜像
+        boolean oPause = mPause; // 记录原本的暂停状态
+        try {save(mMirrorPath);} catch (IOException ignored) {}
+        finally {mPause = oPause;} // 还原暂停状态（因为 save 会改变暂停状态，目前无论如何 save 都会完全暂停）
+        // 最后重置镜像保存需求
+        mNeedSaveMirror = false;
+    }
     
     /// 保存到文件以及从文件加载
     public void save(String aFilePath) throws IOException {
@@ -56,6 +92,8 @@ public final class ServerSLURM {
     // 偏向于内部使用的保存到 json 和从 json 读取
     @SuppressWarnings("unchecked")
     public void save(JSONObject rJson) {
+        // 先暂停然后保存，防止保存过程中出现了修改
+        pause();
         // 先保存 ssh
         JSONObject rJsonSSH = new JSONObject();
         rJson.put("SSH", rJsonSSH);
@@ -67,11 +105,15 @@ public final class ServerSLURM {
         rJsonSLURM.put("SleepTime", mSleepTime);
         rJsonSLURM.put("JobName", mJobName);
         rJsonSLURM.put("Tolerant", mTolerantCounter.mTolerant);
-    
+        
         if (mMaxThisJobNumber < mMaxJobNumber)
             rJsonSLURM.put("MaxThisJobNumber", mMaxThisJobNumber);
-        if (!mSqueueName.equals(mSSH.mSession.getUserName()))
+        if (!mSqueueName.equals(mSSH.session().getUserName()))
             rJsonSLURM.put("SqueueName", mSqueueName);
+        if (mMirrorPath != null) {
+            rJsonSLURM.put("MirrorPath", mMirrorPath);
+            rJsonSLURM.put("MirrorOwner", this.toString()); // 用来在 mirror 切换对象时防止重复提交
+        }
         
         synchronized (mJobIDList) {
         if (!mJobIDList.isEmpty()) {
@@ -98,6 +140,8 @@ public final class ServerSLURM {
                 rJsonCommandList.add(tAfterTask==null?Task.Type.NULL.name():tAfterTask.toString());
             }
         }}
+        
+        // save 操作不自动解除暂停以防止重复提交
     }
     public static ServerSLURM load(JSONObject aJson) throws Exception {
         // 先加载 ssh
@@ -108,12 +152,14 @@ public final class ServerSLURM {
         long aSleepTime = ((Number) tJsonSLURM.get("SleepTime")).longValue();
         String aJobName = (String) tJsonSLURM.get("JobName");
         int aTolerant = ((Number) tJsonSLURM.get("Tolerant")).intValue();
-        String aSqueueName = tJsonSLURM.containsKey("SqueueName") ? (String) tJsonSLURM.get("SqueueName") : aSSH.mSession.getUserName();
+        String aSqueueName = tJsonSLURM.containsKey("SqueueName") ? (String) tJsonSLURM.get("SqueueName") : aSSH.session().getUserName();
         
         ServerSLURM rServerSLURM;
         if (tJsonSLURM.containsKey("MaxThisJobNumber")) rServerSLURM = new ServerSLURM(aSSH, aMaxJobNumber, ((Number) tJsonSLURM.get("MaxThisJobNumber")).intValue(), aSqueueName);
         else rServerSLURM = new ServerSLURM(aSSH, aMaxJobNumber, aSqueueName);
-    
+        // 获取后先暂停防止加载过程中发生了提交
+        rServerSLURM.pause();
+        
         rServerSLURM.setSleepTime(aSleepTime).setTolerant(aTolerant);
         rServerSLURM.mJobName = aJobName;
         
@@ -129,7 +175,11 @@ public final class ServerSLURM {
             for (int i = 2; i < tJsonCommandList.size(); i+=3)
                 rServerSLURM.mCommandList.add(new Pair<>(new Pair<>(Task.fromString(rServerSLURM, (String) tJsonCommandList.get(i-1)), Task.fromString(rServerSLURM, (String) tJsonCommandList.get(i))), (String) tJsonCommandList.get(i-2)));
         }
+        // 最后加载 MirrorPath，会自动进行存储一次
+        if (tJsonSLURM.containsKey("MirrorPath")) rServerSLURM.setMirror((String) tJsonSLURM.get("MirrorPath"));
         
+        // 加载完成解除暂停
+        rServerSLURM.unpause();
         return rServerSLURM;
     }
     
@@ -138,6 +188,7 @@ public final class ServerSLURM {
     private ServerSLURM(ServerSSH aSSH, int aMaxJobNumber, String aSqueueName) {this(aSSH, aMaxJobNumber, aMaxJobNumber, aSqueueName);}
     private ServerSLURM(ServerSSH aSSH, int aMaxJobNumber, int aMaxThisJobNumber, String aSqueueName) {
         mSSH = aSSH;
+        mSSH.doMemberChange = doMemberChange; // 重写 mSSH 的 doMemberChange
         mMaxJobNumber = aMaxJobNumber;
         mMaxThisJobNumber = aMaxThisJobNumber;
         mSqueueName = aSqueueName;
@@ -147,33 +198,33 @@ public final class ServerSLURM {
         mPool.execute(this::keepSubmitFromList_);
     }
     // 不提供密码则认为是私钥登录，提供密码则认为是密码登录
-    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM getKey(int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) throws JSchException {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM getKey(int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) throws JSchException {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.mSession.getUserName());}
+    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey(int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey(int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
     
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) throws JSchException {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) throws JSchException {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
     
-    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM getKey(int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) throws JSchException {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.mSession.getUserName());}
-    public static ServerSLURM getKey(int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) throws JSchException {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.mSession.getUserName());}
+    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey(int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey(int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
     
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) throws JSchException {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) throws JSchException {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) throws JSchException {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
     /// 提供通用的接口，这里直接返回内部的 SSH 省去重复的转发部分
     public ServerSSH ssh() {
         if (mDead) throw new RuntimeException("Can NOT get SSH from a Dead SLURM.");
@@ -188,65 +239,107 @@ public final class ServerSLURM {
         mDead = true;
         mPool.shutdown();
     }
+    public void pause() {
+        mPause = true;
+        // 除了设置暂停，还会挂起直到这批任务提交完成（即等待直到真正暂停）
+        while (mSubmitting) try {Thread.sleep(200);} catch (InterruptedException e) {e.printStackTrace(); break;}
+    }
+    public void unpause() {mPause = false;}
+    // 直接杀死这个对象，类似于系统层面的杀死进程，会直接关闭提交任务并且放弃监管远程服务器的任务而不是取消这些任务，从而使得 mirror 的内容冻结
+    public void kill() {kill(true);}
+    public void kill(boolean aWarning) {
+        // 会先暂停保证正在进行的任务已经完成提交，保证镜像文件不会被这个对象再次修改
+        pause();
+        // 直接设置 mKilled 即可
+        if (aWarning && mMirrorPath == null) System.out.println("WARNING: you killed a slurm without mirror, jobs submit from this may out of control!");
+        mKilled = true;
+        mDead = true;
+        mPool.shutdown();
+    }
     // 一些参数设置
-    public ServerSLURM setSleepTime(long aSleepTime) {mSleepTime = aSleepTime; return this;}
-    public ServerSLURM setTolerant(int aTolerant) {mTolerantCounter.mTolerant = aTolerant; mTolerantCounter.mUsedTolerant = Math.min(mTolerantCounter.mUsedTolerant, mTolerantCounter.mTolerant); return this;}
+    public ServerSLURM setSleepTime(long aSleepTime) {
+        if (mDead) throw new RuntimeException("Can NOT setSleepTime from a Dead SLURM.");
+        mSleepTime = aSleepTime;
+        doMemberChange.run();
+        return this;
+    }
+    public ServerSLURM setTolerant(int aTolerant) {
+        if (mDead) throw new RuntimeException("Can NOT setTolerant from a Dead SLURM.");
+        mTolerantCounter.mTolerant = aTolerant;
+        mTolerantCounter.mUsedTolerant = Math.min(mTolerantCounter.mUsedTolerant, mTolerantCounter.mTolerant);
+        doMemberChange.run(); return this;
+    }
+    public ServerSLURM setMirror(String aPath) {
+        if (mDead) throw new RuntimeException("Can NOT setMirror from a Dead SLURM.");
+        if (aPath.isEmpty()) {mMirrorPath = null; return this;}
+        mMirrorPath = aPath;
+        boolean oPause = mPause; // 记录原本的暂停状态
+        try {save(aPath);}
+        catch (IOException e) {
+            System.out.println("WARNING: set MirrorPath to "+aPath+" Fail, MirrorPath set to null.");
+            mMirrorPath = null;
+        }
+        finally {mPause = oPause;} // 还原暂停状态（因为 save 会改变暂停状态，目前无论如何 save 都会完全暂停）
+        return this;
+    }
     
     /// 内部实用类
     // 内部的从队列中提交任务
     void keepSubmitFromList_() {
         while (true) {
+            mSubmitting = false;
+            // 在这里执行保存到镜像的操作
+            saveToMirror_();
             // 由于检测任务是否完成也需要发送指令，简单起见这里直接限制提交频率为 0.5s 一次（默认）
             try {Thread.sleep(mSleepTime);} catch (InterruptedException e) {e.printStackTrace(); break;}
-            // 从队列中获取指令
-            boolean tIsCoCommandEmpty;
-            synchronized (mCommandList) {tIsCoCommandEmpty = mCommandList.isEmpty();}
-            // 如果没有指令需要提交，并且没有正在执行的任务则需要考虑关闭线程
-            boolean tIsJobEmpty;
-            synchronized(mJobIDList) {tIsJobEmpty = mJobIDList.isEmpty();}
-            if (tIsCoCommandEmpty && tIsJobEmpty) {if (mDead) break; else continue;}
-            // 这里统一检查一次联机状态，如果重新连接失败直接跳过重试
-            if (!mSSH.isConnecting()) try {mSSH.connect();} catch (JSchException e) {continue;}
-            // 首先获取正在执行的任务队列
-            Set<Integer> tJobIDs;
-            try {tJobIDs = jobIDs_();} catch (JSchException | IOException e) {continue;} // 获取失败则直接跳过重试
-            // 首先更新正在执行的任务列表
-            if (!tIsJobEmpty) synchronized(mJobIDList) {
-                // 将不存在 JobIDs 中的计数减一，因为可能因为网络问题导致 jobIDs_ 获取的结果不一定正确
-                for (Map.Entry<Integer, Pair<Task, Integer>> tEntry : mJobIDList.entrySet()) {
-                    if (!tJobIDs.contains(tEntry.getKey())) --(tEntry.getValue().second);
-                    else tEntry.getValue().second = DEFAULT_TOLERANT;
-                }
-                // 将计数小于 1 的移除
-                Iterator<Pair<Task, Integer>> tIt = mJobIDList.values().iterator();
-                final boolean[] tAlive = {true};
-                while (tAlive[0] && tIt.hasNext()) {
-                    Pair<Task, Integer> tPair = tIt.next();
-                    if (tPair.second < 0) {
-                        // 移除前先执行完成后的 task
-                        Task tAfterSystem = tPair.first;
-                        if (tAfterSystem != null) {
-                            boolean tSuc;
-                            try {tSuc = tAfterSystem.run();} catch (Exception e) {tSuc = false;}
-                            mTolerantCounter.call(tSuc, "running after task: "+tAfterSystem, tIt::remove, () -> tAlive[0] = false, tIt::remove);
-                        } else {
-                            tIt.remove();
+            // 如果被杀死则直接结束（优先级最高）
+            if (mKilled) break;
+            // 如果已经暂停则直接跳过
+            if (mPause) continue;
+            // 开始提交任务相关事项，这里在任务提交完成之前都保持 mCommandList 和 mJobIDList 的占用，保证 getTaskNumber 一般会获得正确的值
+            synchronized (mCommandList) {synchronized (mJobIDList) {
+                mSubmitting = true;
+                // 如果没有指令需要提交，并且没有正在执行的任务则需要考虑关闭线程
+                if (mCommandList.isEmpty() && mJobIDList.isEmpty()) {if (mDead) break; else continue;}
+                // 这里统一检查一次联机状态，如果重新连接失败直接跳过重试
+                if (!mSSH.isConnecting()) try {mSSH.connect();} catch (JSchException e) {continue;}
+                // 首先获取正在执行的任务队列
+                Set<Integer> tJobIDs;
+                try {tJobIDs = jobIDs_();} catch (JSchException | IOException e) {continue;} // 获取失败则直接跳过重试
+                // 首先更新正在执行的任务列表
+                if (!mJobIDList.isEmpty()) {
+                    // 将不存在 JobIDs 中的计数减一，因为可能因为网络问题导致 jobIDs_ 获取的结果不一定正确
+                    for (Map.Entry<Integer, Pair<Task, Integer>> tEntry : mJobIDList.entrySet()) {
+                        if (!tJobIDs.contains(tEntry.getKey())) --(tEntry.getValue().second);
+                        else tEntry.getValue().second = DEFAULT_TOLERANT;
+                    }
+                    // 将计数小于 1 的移除
+                    final Iterator<Pair<Task, Integer>> tIt = mJobIDList.values().iterator();
+                    final boolean[] tAlive = {true};
+                    while (tAlive[0] && tIt.hasNext()) {
+                        Pair<Task, Integer> tPair = tIt.next();
+                        if (tPair.second < 0) {
+                            // 移除前先执行完成后的 task
+                            Task tAfterSystem = tPair.first;
+                            if (tAfterSystem != null) {
+                                boolean tSuc;
+                                try {tSuc = tAfterSystem.run();} catch (Exception e) {tSuc = false;}
+                                mTolerantCounter.call(tSuc, "running after task: "+tAfterSystem, () -> {tIt.remove(); doMemberChange.run();}, () -> tAlive[0] = false, () -> {tIt.remove(); doMemberChange.run();});
+                            } else {
+                                tIt.remove(); doMemberChange.run();
+                            }
                         }
                     }
+                    // 如果期间发生了不成功的现象，则 tAlive 为 false，不再进行后续操作并重试
+                    if (!tAlive[0]) continue;
                 }
-                // 如果期间发生了不成功的现象，则 tAlive 为 false，不再进行后续操作并重试
-                if (!tAlive[0]) continue;
-                // 更新 tIsJobEmpty 避免意料之外的情况
-                tIsJobEmpty = mJobIDList.isEmpty();
-            }
-            // 准备提交任务，如果没有任务则跳过
-            if (tIsCoCommandEmpty) continue;
-            // 如果正在执行的任务列表超过限制，则不会提交
-            if (tJobIDs.size() >= mMaxJobNumber) continue;
-            // 如果此对象正在执行的任务超过限制，则不会提交
-            if (!tIsJobEmpty) synchronized(mJobIDList) {if (mJobIDList.size() >= mMaxThisJobNumber) continue;}
-            // 获取和提交任务，这里在任务提交完成之前都保持 mCommandList 和 mJobIDList 的占用，保证 getTaskNumber 一般会获得正确的值
-            synchronized (mCommandList) {synchronized (mJobIDList) {
+                // 准备提交任务，如果没有任务则跳过
+                if (mCommandList.isEmpty()) continue;
+                // 如果正在执行的任务列表超过限制，则不会提交
+                if (tJobIDs.size() >= mMaxJobNumber) continue;
+                // 如果此对象正在执行的任务超过限制，则不会提交
+                if (mJobIDList.size() >= mMaxThisJobNumber) continue;
+                // 获取和提交任务
                 Pair<Pair<Task, Task>, String> tPair = mCommandList.peekFirst();
                 if (tPair == null) continue;
                 final Pair<Task, Task> tTasks = tPair.first;
@@ -254,23 +347,27 @@ public final class ServerSLURM {
                 if (tTasks.first != null) {
                     boolean tSuc;
                     try {tSuc = tTasks.first.run();} catch (Exception e) {tSuc = false;}
-                    mTolerantCounter.call(tSuc, "running before task: "+tTasks.first, mCommandList::removeFirst, () -> {}, () -> tTasks.first = null);
+                    mTolerantCounter.call(tSuc, "running before task: "+tTasks.first, () -> {mCommandList.removeFirst(); doMemberChange.run();}, () -> {}, () -> {tTasks.first = null; doMemberChange.run();});
                     if (!tSuc) continue; // 只要不成功都需要跳过后续并重试
                 }
                 // 获取执行命令的通道
                 ChannelExec tChannelExec = null;
                 try {tChannelExec = mSSH.systemChannel(tCommand);} catch (JSchException ignored) {}
-                mTolerantCounter.call(tChannelExec != null, "get ChannelExec: "+tCommand, mCommandList::removeFirst);
+                mTolerantCounter.call(tChannelExec != null, "get ChannelExec: "+tCommand, () -> {mCommandList.removeFirst(); doMemberChange.run();});
                 if (tChannelExec == null) continue; // 只要不成功都需要跳过后续并重试
                 // 提交命令并且获取任务号
                 int tJobID = getJobIDFromChannel_(tChannelExec);
-                mTolerantCounter.call(tJobID > 0, "get JobID("+tJobID+"): "+tCommand, mCommandList::removeFirst);
+                mTolerantCounter.call(tJobID > 0, "get JobID("+tJobID+"): "+tCommand, () -> {mCommandList.removeFirst(); doMemberChange.run();});
                 if (tJobID <= 0) continue; // 只要不成功都需要跳过后续并重试
                 // 成功获取，移出 mCommandList 并添加到 mJobIDList
                 mCommandList.removeFirst();
                 mJobIDList.put(tJobID, new Pair<>(tTasks.second, DEFAULT_TOLERANT));
+                doMemberChange.run();
             }}
         }
+        mSubmitting = false;
+        // 最后再执行一次保存到镜像的操作
+        saveToMirror_();
         // 最后关闭 SSH 通道
         mSSH.shutdown();
     }
@@ -336,7 +433,7 @@ public final class ServerSLURM {
         aCommand = String.format("echo -e '#!/bin/bash\\n%s' | sbatch --nodes %d --output %s --job-name %s", aCommand, aNodeNumber, aOutputPath, mJobName);
         if (aPartition != null && !aPartition.isEmpty()) aCommand += String.format(" --partition %s", aPartition);
         // 添加指令到队列
-        synchronized (mCommandList) {mCommandList.addLast(new Pair<>(new Pair<>(aBeforeSystem, aAfterSystem), aCommand));}
+        synchronized (mCommandList) {mCommandList.addLast(new Pair<>(new Pair<>(aBeforeSystem, aAfterSystem), aCommand)); doMemberChange.run();}
     }
     
     /**
@@ -376,7 +473,7 @@ public final class ServerSLURM {
         if (aNodeNumber > 0) tCommand += String.format(" --nodes %d", aNodeNumber);
         tCommand += String.format(" %s", aBashPath);
         // 添加指令到队列
-        synchronized (mCommandList) {mCommandList.addLast(new Pair<>(new Pair<>(aBeforeSystem, aAfterSystem), tCommand));}
+        synchronized (mCommandList) {mCommandList.addLast(new Pair<>(new Pair<>(aBeforeSystem, aAfterSystem), tCommand)); doMemberChange.run();}
     }
     
     /**
@@ -483,9 +580,9 @@ public final class ServerSLURM {
     };}
     public void cancelAll() throws JSchException, IOException {
         if (mDead) throw new RuntimeException("Can NOT cancelAll from a Dead SLURM.");
-        synchronized(mCommandList) {mCommandList.clear();}
+        synchronized(mCommandList) {mCommandList.clear(); doMemberChange.run();}
         mSSH.system(String.format("scancel --user %s --full", mSqueueName));
-        synchronized(mJobIDList) {mJobIDList.clear();}
+        synchronized(mJobIDList) {mJobIDList.clear(); doMemberChange.run();}
     }
     
     // 取消这个对象一共提交的所有任务
@@ -495,19 +592,19 @@ public final class ServerSLURM {
     };}
     public void cancelThis() throws JSchException, IOException {
         if (mDead) throw new RuntimeException("Can NOT cancelThis from a Dead SLURM.");
-        synchronized(mCommandList) {mCommandList.clear();}
+        synchronized(mCommandList) {mCommandList.clear(); doMemberChange.run();}
         boolean tIsJobEmpty;
         synchronized(mJobIDList) {tIsJobEmpty = mJobIDList.isEmpty();}
         if (!tIsJobEmpty) {
             mSSH.system(String.format("scancel --name %s", mJobName));
-            synchronized(mJobIDList) {mJobIDList.clear();}
+            synchronized(mJobIDList) {mJobIDList.clear(); doMemberChange.run();}
         }
     }
     
     // 撤销上一步提交的任务（如果已经交上去则会失败）
     public Pair<Pair<Task, Task>, String> undo() {
         Pair<Pair<Task, Task>, String> tCommand;
-        synchronized (mCommandList) {tCommand = mCommandList.pollLast();}
+        synchronized (mCommandList) {tCommand = mCommandList.pollLast(); doMemberChange.run();}
         return tCommand;
     }
     

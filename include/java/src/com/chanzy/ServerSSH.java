@@ -28,7 +28,7 @@ public final class ServerSSH {
     String mRemoteWorkingDir;
     // jsch stuffs
     final JSch mJsch;
-    Session mSession;
+    private Session mSession;
     // 为了实现断开重连需要暂存密码
     private String mPassword = null;
     // 暂存密钥路径以供保存和加载
@@ -37,6 +37,10 @@ public final class ServerSSH {
     private String mBeforeCommand = null;
     // 记录是否已经被关闭
     private boolean mDead = false;
+    
+    /// hooks, 修改这个来实现重写，我也不知道这个方法是不是合理
+    // 发生内部参数改变都需要调用一下这个函数
+    Runnable doMemberChange = () -> {};
     
     /// 保存到文件以及从文件加载
     public void save(String aFilePath) throws IOException {
@@ -55,9 +59,9 @@ public final class ServerSSH {
     // 偏向于内部使用的保存到 json 和从 json 读取
     @SuppressWarnings("unchecked")
     public void save(JSONObject rJson) {
-        rJson.put("Username", mSession.getUserName());
-        rJson.put("Hostname", mSession.getHost());
-        rJson.put("Port", mSession.getPort());
+        rJson.put("Username", session().getUserName());
+        rJson.put("Hostname", session().getHost());
+        rJson.put("Port", session().getPort());
         
         if (!mLocalWorkingDir.isEmpty() && !mLocalWorkingDir.equals(System.getProperty("user.home")+"/"))
             rJson.put("LocalWorkingDir", mLocalWorkingDir);
@@ -71,7 +75,7 @@ public final class ServerSSH {
             rJson.put("BeforeCommand", mBeforeCommand);
         
         int tCompressLevel = -1;
-        if (!mSession.getConfig("compression.c2s").equals("none")) tCompressLevel = Integer.parseInt(mSession.getConfig("compression_level"));
+        if (!session().getConfig("compression.c2s").equals("none")) tCompressLevel = Integer.parseInt(session().getConfig("compression_level"));
         if (tCompressLevel > 0)
             rJson.put("CompressLevel", tCompressLevel);
     }
@@ -101,88 +105,104 @@ public final class ServerSSH {
     }
     
     /// 构造函数以及获取方式（用来区分私钥登录以及密码登录）
-    private ServerSSH(String aUsername, String aHostname, int aPort) throws JSchException {
+    private ServerSSH(String aUsername, String aHostname, int aPort) {
         mJsch = new JSch();
-        mSession = mJsch.getSession(aUsername, aHostname, aPort);
-        mSession.setConfig("StrictHostKeyChecking", "no");
+        try {mSession = mJsch.getSession(aUsername, aHostname, aPort);} catch (JSchException e) {throw new RuntimeException(e);}
+        session().setConfig("StrictHostKeyChecking", "no");
     }
     // 不提供密码则认为是私钥登录，提供密码则认为是密码登录
-    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) throws JSchException {return get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22);}
-    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) throws JSchException {return getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, System.getProperty("user.home")+"/.ssh/id_rsa");}
-    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) throws JSchException {return get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22, aPassword);}
-    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) throws JSchException {
+    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {return get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22);}
+    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {return getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, System.getProperty("user.home")+"/.ssh/id_rsa");}
+    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {return get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22, aPassword);}
+    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {
         ServerSSH rServerSSH = new ServerSSH(aUsername, aHostname, aPort).setLocalWorkingDir(aLocalWorkingDir).setRemoteWorkingDir(aRemoteWorkingDir);
         rServerSSH.mSession.setPassword(aPassword);
         rServerSSH.mPassword = aPassword;
         rServerSSH.mSession.setConfig("PreferredAuthentications", "password");
-        rServerSSH.mSession.connect();
+        try {rServerSSH.mSession.connect();} catch (JSchException e) {e.printStackTrace();}
         return rServerSSH;
     }
-    public static ServerSSH getKey(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath) throws JSchException {return getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22, aKeyPath);}
-    public static ServerSSH getKey(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath) throws JSchException {
+    public static ServerSSH getKey(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath) {return getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22, aKeyPath);}
+    public static ServerSSH getKey(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath) {
         ServerSSH rServerSSH = new ServerSSH(aUsername, aHostname, aPort).setLocalWorkingDir(aLocalWorkingDir).setRemoteWorkingDir(aRemoteWorkingDir);
-        rServerSSH.mJsch.addIdentity(aKeyPath);
+        try {rServerSSH.mJsch.addIdentity(aKeyPath);} catch (JSchException e) {e.printStackTrace();}
         rServerSSH.mKeyPath = aKeyPath;
         rServerSSH.mSession.setConfig("PreferredAuthentications", "publickey");
-        rServerSSH.mSession.connect();
+        try {rServerSSH.mSession.connect();} catch (JSchException e) {e.printStackTrace();}
         return rServerSSH;
     }
     // 修改本地路径和远程路径
     public ServerSSH setLocalWorkingDir(String aLocalWorkingDir) {
+        if (mDead) throw new RuntimeException("Can NOT setLocalWorkingDir from a Dead SSH.");
         if (aLocalWorkingDir == null || aLocalWorkingDir.isEmpty()) aLocalWorkingDir = System.getProperty("user.home")+"/";
         if (!aLocalWorkingDir.endsWith("/") && !aLocalWorkingDir.endsWith("\\")) aLocalWorkingDir += "/";
         mLocalWorkingDir = aLocalWorkingDir;
+        doMemberChange.run();
         return this;
     }
     public ServerSSH setRemoteWorkingDir(String aRemoteWorkingDir) {
+        if (mDead) throw new RuntimeException("Can NOT setRemoteWorkingDir from a Dead SSH.");
         if (aRemoteWorkingDir == null) aRemoteWorkingDir = "";
         if (!aRemoteWorkingDir.isEmpty() && !aRemoteWorkingDir.endsWith("/") && !aRemoteWorkingDir.endsWith("\\")) aRemoteWorkingDir += "/";
         if (aRemoteWorkingDir.startsWith("~/")) aRemoteWorkingDir = aRemoteWorkingDir.substring(2); // JSch 不支持 ~
         mRemoteWorkingDir = aRemoteWorkingDir;
+        doMemberChange.run();
         return this;
     }
     // 设置数据传输的压缩等级
     public ServerSSH setCompressionLevel(int aCompressionLevel) throws Exception {
+        if (mDead) throw new RuntimeException("Can NOT setCompressionLevel from a Dead SSH.");
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 根据输入设置压缩等级
         if (aCompressionLevel > 0) {
-            mSession.setConfig("compression.s2c", "zlib@openssh.com,zlib,none");
-            mSession.setConfig("compression.c2s", "zlib@openssh.com,zlib,none");
-            mSession.setConfig("compression_level", String.valueOf(aCompressionLevel));
+            session().setConfig("compression.s2c", "zlib@openssh.com,zlib,none");
+            session().setConfig("compression.c2s", "zlib@openssh.com,zlib,none");
+            session().setConfig("compression_level", String.valueOf(aCompressionLevel));
         } else {
-            mSession.setConfig("compression.s2c", "none");
-            mSession.setConfig("compression.c2s", "none");
+            session().setConfig("compression.s2c", "none");
+            session().setConfig("compression.c2s", "none");
         }
-        mSession.rekey();
+        doMemberChange.run();
+        session().rekey();
         return this;
     }
     // 设置执行 system 之前的附加指令
-    public ServerSSH setBeforeSystem(String aCommand) {mBeforeCommand = aCommand; return this;}
+    public ServerSSH setBeforeSystem(String aCommand) {
+        if (mDead) throw new RuntimeException("Can NOT setBeforeSystem from a Dead SSH.");
+        mBeforeCommand = aCommand;
+        doMemberChange.run();
+        return this;
+    }
     // 设置密码
     public ServerSSH setPassword(String aPassword) throws Exception {
+        if (mDead) throw new RuntimeException("Can NOT setPassword from a Dead SSH.");
         mJsch.removeAllIdentity(); // 移除旧的认证
-        mSession.setPassword(aPassword);
+        session().setPassword(aPassword);
         mPassword = aPassword;
         mKeyPath = null;
-        mSession.setConfig("PreferredAuthentications", "password");
-        mSession.rekey();
+        session().setConfig("PreferredAuthentications", "password");
+        doMemberChange.run();
+        session().rekey();
         return this;
     }
     // 设置密钥路径
     public ServerSSH setKey(String aKeyPath) throws Exception {
+        if (mDead) throw new RuntimeException("Can NOT setKey from a Dead SSH.");
         mJsch.removeAllIdentity(); // 移除旧的认证
         mJsch.addIdentity(aKeyPath);
         mPassword = null;
         mKeyPath = aKeyPath;
-        mSession.setConfig("PreferredAuthentications", "publickey");
-        mSession.rekey();
+        session().setConfig("PreferredAuthentications", "publickey");
+        doMemberChange.run();
+        session().rekey();
         return this;
     }
     
     /// 基本方法
-    public boolean isConnecting() {return mSession.isConnected();}
-    public void connect() throws JSchException {
+    public boolean isConnecting() {return session().isConnected();}
+    // 整个 connect 过程都需要同步，避免连接到一半其他线程获取到非法的 session
+    public synchronized void connect() throws JSchException {
         if (mDead) throw new RuntimeException("Can NOT reconnect a Dead SSH.");
         if (!mSession.isConnected()) {
             Session oSession = mSession;
@@ -196,10 +216,13 @@ public final class ServerSSH {
             mSession.connect();
         }
     }
+    public void disconnect() {session().disconnect();}
     public void shutdown() {
         mDead = true;
-        mSession.disconnect();
+        session().disconnect();
     }
+    // 获取和修改 mSession，需要增加同步来保证每个线程获得的 mSession 都是合适的
+    public synchronized Session session() {return mSession;}
     
     /// 实用方法
     // 提交命令
@@ -226,7 +249,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取执行指令的频道
-        ChannelExec tChannelExec = (ChannelExec) mSession.openChannel("exec");
+        ChannelExec tChannelExec = (ChannelExec) session().openChannel("exec");
         tChannelExec.setInputStream(null);
         tChannelExec.setErrStream(System.err);
         if (mBeforeCommand != null && !mBeforeCommand.isEmpty()) aCommand = String.format("%s;%s", mBeforeCommand, aCommand);
@@ -244,7 +267,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取文件传输通道
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
@@ -266,7 +289,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取文件传输通道
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
@@ -288,7 +311,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取文件传输通道
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
@@ -309,7 +332,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取文件传输通道
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
@@ -331,7 +354,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取文件传输通道
-        ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
@@ -348,7 +371,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取文件传输通道
-        ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
@@ -368,7 +391,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取文件传输通道
-        ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         // 检测文件路径是否合法
         File tLocalFile = new File(mLocalWorkingDir+aFilePath);
@@ -394,7 +417,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取文件传输通道
-        ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         // 检测文件路径是否合法
         String tRemoteDir = mRemoteWorkingDir+aFilePath;
@@ -419,7 +442,7 @@ public final class ServerSSH {
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
         // 获取文件传输通道
-        ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         String tRemotePath = mRemoteWorkingDir+aPath;
         // 获取结果
@@ -439,7 +462,7 @@ public final class ServerSSH {
         // 创建并发线程池，会自动尝试重新连接
         final SftpPool tSftpPool = new SftpPool(this, aThreadNumber);
         // 获取文件传输通道，还是需要一个专门的频道来串行执行创建文件夹
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
@@ -463,7 +486,7 @@ public final class ServerSSH {
         // 创建并发线程池，会自动尝试重新连接
         final SftpPool tSftpPool = new SftpPool(this, aThreadNumber);
         // 获取文件传输通道，需要一个专门的频道来串行执行获取目录等操作
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
@@ -487,7 +510,7 @@ public final class ServerSSH {
         // 创建并发线程池，会自动尝试重新连接
         final SftpPool tSftpPool = new SftpPool(this, aThreadNumber);
         // 获取文件传输通道，需要一个专门的频道来串行执行获取目录等操作
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         if (aDir.equals(".")) aDir = "";
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
@@ -517,7 +540,7 @@ public final class ServerSSH {
         // 创建并发线程池，会自动尝试重新连接
         final SftpPool tSftpPool = new SftpPool(this, aThreadNumber);
         // 获取文件传输通道，还是需要一个专门的频道来串行执行创建文件夹
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         // 递归子文件夹传输文件
         (new RecurseLocalDir(this, "") {
@@ -548,7 +571,7 @@ public final class ServerSSH {
         // 创建并发线程池，会自动尝试重新连接
         final SftpPool tSftpPool = new SftpPool(this, aThreadNumber);
         // 获取文件传输通道，需要一个专门的频道来串行执行获取目录等操作
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         // 递归子文件夹传输文件
         (new RecurseRemoteDir(this, "", tChannelSftp) {
@@ -579,7 +602,7 @@ public final class ServerSSH {
         // 创建并发线程池，会自动尝试重新连接
         final SftpPool tSftpPool = new SftpPool(this, aThreadNumber);
         // 获取文件传输通道，需要一个专门的频道来串行执行获取目录等操作
-        final ChannelSftp tChannelSftp = (ChannelSftp) mSession.openChannel("sftp");
+        final ChannelSftp tChannelSftp = (ChannelSftp) session().openChannel("sftp");
         tChannelSftp.connect();
         // 需要删除的文件夹列表，由于是并发操作的，文件夹需要最后串行删除一次
         final List<String> tDirList = new ArrayList<>();
@@ -682,7 +705,7 @@ public final class ServerSSH {
             }
             doDirFinal(aRemoteDir, aLocalDir);
         }
-    
+        
         // stuff to override
         public boolean initLocalDir(String aLocalDir) {return true;} // 开始遍历远程文件夹之前初始化对应的本地文件夹，返回 false 则表示此本地文件夹初始失败，不会进行后续的遍历此文件夹操作
         public void doFile(String aRemoteFile, String aLocalDir) {/**/} // 对于此远程文件夹内的文件进行操作
@@ -706,7 +729,7 @@ public final class ServerSSH {
             mPool = Executors.newFixedThreadPool(aThreadNumber);
             // 提交长期任务
             for (int i = 0; i < aThreadNumber; ++i) {
-                final ChannelSftp tChannelSftp = (ChannelSftp) aSSH.mSession.openChannel("sftp");
+                final ChannelSftp tChannelSftp = (ChannelSftp) aSSH.session().openChannel("sftp");
                 mPool.execute(() -> {
                     try {tChannelSftp.connect();} catch (JSchException e) {tChannelSftp.disconnect(); throw new RuntimeException(e);}
                     // 每个 Sftp 都从 mTaskList 中竞争获取 task 并执行
