@@ -68,7 +68,7 @@ slurm = ServerSLURM.get(8, 'path/to/project/in/local', 'path/to/project/in/remot
 slurm.ssh().putDir('path/to/in/file/dir', 4);
 % 提交 njobs 个 srun 任务，每个任务使用 40 个核计算，每个节点最多 20 核（没设置分区则会在默认分区执行）
 for i = 1:njobs
-    slurm.submitSrun('software/in/remote < path/to/in/file-' + num2str(i), 40, 20);
+    slurm.submitSrun(['software/in/remote < path/to/in/file-' num2str(i)], 40, 20);
 end
 % 等待任务执行完成
 slurm.waitUntilDone();
@@ -98,10 +98,10 @@ slurm.ssh().putDir('path/to/in/file/dir', 4);
 对于超长时间的任务，smartSLURM 支持 `setMirror` 的功能，可以设置本地的镜像，后续需要可以重新读取镜像继续任务：
 ```matlab
 % 设置本地镜像
-slurm.setMirror('path/to/loacl/mirror');
+slurm.setMirror('path/to/local/mirror');
 % 同样提交任务
 for i = 1:njobs
-    slurm.submitSrun('software/in/remote < path/to/in/file-' + num2str(i), 40, 20);
+    slurm.submitSrun(['software/in/remote < path/to/in/file-' num2str(i)], 40, 20);
 end
 % 等待一段时间等待任务提交完成
 pause(60);
@@ -113,7 +113,7 @@ pause(60);
 slurm.kill();
 % ...
 % 等待需要检测时重新加载镜像来查看任务完成情况
-slurm = ServerSLURM.load('path/to/loacl/mirror');
+slurm = ServerSLURM.load('path/to/local/mirror');
 if slurm.getTaskNumber() > 0
     disp('Jobs not finish yet.');
 else
@@ -137,7 +137,7 @@ taskBefore = slurm.ssh().task_putDir('path/to/in/file/dir', 4);
 taskAfter = slurm.ssh().task_getDir('path/to/out/file/dir', 4);
 % 提交任务，将这两个 task 附加上去
 for i = 1:njobs
-    slurm.submitSrun(taskBefore, taskAfter, 'software/in/remote < path/to/in/file-' + num2str(i), 40, 20);
+    slurm.submitSrun(taskBefore, taskAfter, ['software/in/remote < path/to/in/file-' num2str(i)], 40, 20);
 end
 % 等待任务完成...
 % ...

@@ -1,7 +1,7 @@
 **切换到 [中文](README.md)**
 
 # SmartSLURM
-A SLURM controler make you use SLURM like a local application, 
+A SLURM controller make you use SLURM like a local application, 
 which make it easy to handle workflows such as:
 
 $$
@@ -72,7 +72,7 @@ slurm = ServerSLURM.get(8, 'path/to/project/in/local', 'path/to/project/in/remot
 slurm.ssh().putDir('path/to/in/file/dir', 4);
 % Submit njobs srun jobs, each job use 40 cores, and each node has a maximum of 20 cores (it will be executed in the default partition if no partition set)
 for i = 1:njobs
-    slurm.submitSrun('software/in/remote < path/to/in/file-' + num2str(i), 40, 20);
+    slurm.submitSrun(['software/in/remote < path/to/in/file-' num2str(i)], 40, 20);
 end
 % Wait for the jobs to complete
 slurm.waitUntilDone();
@@ -103,10 +103,10 @@ For long time jobs, smartSLURM supports `setMirror` function,
 which can set a local mirror file that can be reloaded later to continue the jobs:
 ```matlab
 % Set local mirror
-slurm.setMirror('path/to/loacl/mirror');
+slurm.setMirror('path/to/local/mirror');
 % Submit jobs as usual
 for i = 1:njobs
-    slurm.submitSrun('software/in/remote < path/to/in/file-' + num2str(i), 40, 20);
+    slurm.submitSrun(['software/in/remote < path/to/in/file-' num2str(i)], 40, 20);
 end
 % Wait for a while for jobs to be submitted
 pause(60);
@@ -118,7 +118,7 @@ pause(60);
 slurm.kill();
 % ...
 % To check if the jobs have finished, reload the mirror and see if there are any jobs left
-slurm = ServerSLURM.load('path/to/loacl/mirror');
+slurm = ServerSLURM.load('path/to/local/mirror');
 if slurm.getTaskNumber() > 0
     disp('Jobs not finish yet.');
 else
@@ -146,7 +146,7 @@ taskBefore = slurm.ssh().task_putDir('path/to/in/file/dir', 4);
 taskAfter = slurm.ssh().task_getDir('path/to/out/file/dir', 4);
 % Submit the job and attach these two tasks
 for i = 1:njobs
-    slurm.submitSrun(taskBefore, taskAfter, 'software/in/remote < path/to/in/file-' + num2str(i), 40, 20);
+    slurm.submitSrun(taskBefore, taskAfter, ['software/in/remote < path/to/in/file-' num2str(i)], 40, 20);
 end
 % Wait for the job to complete...
 % ...
