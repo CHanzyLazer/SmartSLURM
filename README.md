@@ -15,8 +15,8 @@ $$
 \end{array}
 $$
 
-本程序包含两个部分，[ServerSSH](include/java/src/ServerSSH.java) 包含基本的管理 ssh 服务器的方法，
-[ServerSLURM](include/java/src/ServerSLURM.java) 则专门对支持 SLURM 系统的服务器进行了适配
+本程序包含两个部分，[ServerSSH](include/java/src/com/chanzy/ServerSSH.java) 包含基本的管理 ssh 服务器的方法，
+[ServerSLURM](include/java/src/com/chanzy/ServerSLURM.java) 则专门对支持 SLURM 系统的服务器进行了适配
 
 本程序使用 java 编写，使用 [jsch](http://www.jcraft.com/jsch/) 来实现连接 ssh 服务器以及基本的功能，
 并在此基础上补充了常用的功能，并对文件传输部分进行了专门的优化
@@ -172,66 +172,105 @@ suc = code.UT.tryTask(task, 3);
 
 
 # 接口说明
-- **`ServerSSH`**: 提供基本的管理 ssh 服务器的方法，所有操作都会在连接中断后尝试一次重新连接
+- **`ServerSSH`**：
+提供基本的管理 ssh 服务器的方法，所有操作都会在连接中断后尝试一次重新连接
     - **保存和加载**
-        - `save(FilePath)`：保存这个 ssh 端到 `FilePath`，保存为 json 格式，
+        - `save(FilePath)`：
+        保存这个 ssh 端到 `FilePath`，保存为 json 格式，
         **注意这个保存是没有加密，如果有密码则会保存明文的密码，需要保管好文件，如果在意可以使用密钥连接**
-        - `load(FilePath)`：静态方法，从 `FilePath` 加载 ssh 端
+        - `load(FilePath)`：
+        静态方法，从 `FilePath` 加载 ssh 端
     - **获取对象**
-        - `get(LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], [Password])`：静态方法，获取 ssh 终端并且连接到终端，
-        在不提供密码时会使用密钥登录，默认会使用 `{user.home}/.ssh/id_rsa` 位置的密钥
-        - `getKey(LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], KeyPath)`：静态方法，获取 ssh 终端并且连接到终端，
-        使用 `KeyPath` 位置的密钥进行认证，
+        - `get(LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], [Password])`：
+        静态方法，获取 ssh 终端并且连接到终端，在不提供密码时会使用密钥登录，默认会使用 `{user.home}/.ssh/id_rsa` 位置的密钥
+        - `getKey(LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], KeyPath)`：
+        静态方法，获取 ssh 终端并且连接到终端，使用 `KeyPath` 位置的密钥进行认证，
         **注意 jsch 只支持经典格式的 openSSH 密钥，因此在生成密钥时需要加上 `-m pem` 参数**
     - **参数设置**
-        - `setLocalWorkingDir(LocalWorkingDir)`：设置本地的工作目录，输入 null 或者空字符串则会设置为系统的用户路径 `System.getProperty("user.home")`
-        - `setRemoteWorkingDir(RemoteWorkingDir)`：设置远程服务器的工作目录，输入 null 或者空字符串则会设置为连接 ssh 时所在的默认路径
-        - `setCompressionLevel(CompressionLevel)`: 设置 ssh 传输时的压缩等级（1-9），设置小于等于 0 的值会关闭压缩，默认不进行压缩
-        - `setBeforeSystem(Command)`：设置在执行 `system` 指令之前永远会附加的指令，例如环境变量的设置等等
-        - `setPassword(Password)`：修改登录的密码，同时会将认证模式修改为密码认证
-        - `setKey(KeyPath)`：修改密钥路径，同时会将认证模式修改为密钥认证
+        - `setLocalWorkingDir(LocalWorkingDir)`：
+        设置本地的工作目录，输入 null 或者空字符串则会设置为系统的用户路径 `System.getProperty("user.home")`
+        - `setRemoteWorkingDir(RemoteWorkingDir)`：
+        设置远程服务器的工作目录，输入 null 或者空字符串则会设置为连接 ssh 时所在的默认路径
+        - `setCompressionLevel(CompressionLevel)`：
+        设置 ssh 传输时的压缩等级（1-9），设置小于等于 0 的值会关闭压缩，默认不进行压缩
+        - `setBeforeSystem(Command)`：
+        设置在执行 `system` 指令之前永远会附加的指令，例如环境变量的设置等等
+        - `setPassword(Password)`：
+        修改登录的密码，同时会将认证模式修改为密码认证
+        - `setKey(KeyPath)`：
+        修改密钥路径，同时会将认证模式修改为密钥认证
     - **基本方法**
-        - `isConnecting()`: 检测 ssh 是否正保持着连接
-        - `connect()`: 如果连接被断开则会重新连接，一般不需要手动调用因为基本所有方法都会尝试一次重新连接
-        - `disconnect()`：手动断开 ssh 的连接，一般不需要手动调用因为基本所有方法都会尝试一次重新连接
-        - `shutdown()`: 断开连接并且关闭此 ssh 终端，不再允许其他操作
-        - `session()`：返回当前 ssh 的 session，一般不需要使用因为大部分常用功能已经经过了包装
+        - `isConnecting()`：
+        检测 ssh 是否正保持着连接
+        - `connect()`：
+        如果连接被断开则会重新连接，一般不需要手动调用因为基本所有方法都会尝试一次重新连接
+        - `disconnect()`：
+        手动断开 ssh 的连接，一般不需要手动调用因为基本所有方法都会尝试一次重新连接
+        - `shutdown()`：
+        断开连接并且关闭此 ssh 终端，不再允许其他操作
+        - `session()`：
+        返回当前 ssh 的 session，一般不需要使用因为大部分常用功能已经经过了包装
     - **实用方法**
-        - `[task_]system(Command)`: 在 ssh 终端上执行指令，类似 matlab 中的 system 函数。
-        可以附加 `task_` 来获得此方法的 Task 对象（下同）
-        - `[task_]putDir(Dir, [ThreadNumber])`: 上传目录 `Dir` 到远程服务器，设置 `ThreadNumber` 则会开 启并发上传，注意设置 `ThreadNumber=1` 与不设置并不等价。
+        - `[task_]system(Command)`：
+        在 ssh 终端上执行指令，类似 matlab 中的 system 函数。可以附加 `task_` 来获得此方法的 Task 对象（下同）
+        - `[task_]putDir(Dir, [ThreadNumber])`：
+        上传目录 `Dir` 到远程服务器，设置 `ThreadNumber` 则会开启并发上传，注意设置 `ThreadNumber=1` 与不设置并不等价。
         支持递归子文件夹进行上传，对于大文件可以通过 `setCompressionLevel(CompressionLevel)` 来开启压缩来加速
-        - `[task_]getDir(Dir, [ThreadNumber])`: 下载远程服务器的目录 `Dir` 到本地，设置 `ThreadNumber` 则会开启并发下载，注意设置 `ThreadNumber=1` 与不设置并不等价。
+        - `[task_]getDir(Dir, [ThreadNumber])`：
+        下载远程服务器的目录 `Dir` 到本地，设置 `ThreadNumber` 则会开启并发下载，注意设置 `ThreadNumber=1` 与不设置并不等价。
         支持递归子文件夹进行下载，对于大文件可以通过 `setCompressionLevel(CompressionLevel)` 来开启压缩来加速
-        - `[task_]clearDir(Dir, [ThreadNumber])`: 清空远程服务器的目录 `Dir`，但是不删除文件夹，设置 `ThreadNumber` 则会开启并发下载，注意设置 `ThreadNumber=1` 与不设置并不等价。
+        - `[task_]clearDir(Dir, [ThreadNumber])`：
+        清空远程服务器的目录 `Dir`，但是不删除文件夹，设置 `ThreadNumber` 则会开启并发下载，注意设置 `ThreadNumber=1` 与不设置并不等价。
         支持递归子文件夹进行清空
-        - `[task_]rmdir(Dir)`: 移除远程服务器的目录 `Dir`，支持递归子文件夹进行删除
-        - `[task_]mkdir(Dir)`: 在创建远程服务器上创建目录 `Dir`，支持跨文件夹创建文件夹，如果已经存在文件夹或者创建文件夹成功则返回 true，创建文件夹失败返回 false
-        - `isDir(Dir)`：判断输入的 `Dir` 是否在远程服务器上是一个目录
-        - `[task_]putFile(FilePath)`：上传位于 `FilePath` 的文件到远程服务器
-        - `[task_]getFile(FilePath)`：下载远程服务器上位于 `FilePath` 的文件到本地
-        - `isFile(Path)`：判断输入的 `Path` 是否在远程服务器上是一个文件
-        - `[task_]putWorkingDir(ThreadNumber=4)`: 上传整个工作目录到远程服务器，忽略 '.'，'_' 开头的 文件和文件夹，
+        - `[task_]rmdir(Dir)`：
+        移除远程服务器的目录 `Dir`，支持递归子文件夹进行删除
+        - `[task_]mkdir(Dir)`：
+        在创建远程服务器上创建目录 `Dir`，支持跨文件夹创建文件夹，
+        如果已经存在文件夹或者创建文件夹成功则返回 true，创建文件夹失败返回 false
+        - `isDir(Dir)`：
+        判断输入的 `Dir` 是否在远程服务器上是一个目录
+        - `[task_]putFile(FilePath)`：
+        上传位于 `FilePath` 的文件到远程服务器
+        - `[task_]getFile(FilePath)`：
+        下载远程服务器上位于 `FilePath` 的文件到本地
+        - `isFile(Path)`：
+        判断输入的 `Path` 是否在远程服务器上是一个文件
+        - `[task_]putWorkingDir(ThreadNumber=4)`：
+        上传整个工作目录到远程服务器，忽略 '.'，'_' 开头的 文件和文件夹，
         注意如果本地工作目录是默认系统的用户路径则不允许此操作
-        - `[task_]getWorkingDir(ThreadNumber=4)`: 从远程服务器下载整个工作目录到本地，忽略 '.'，'_' 开头的文件和文件夹，
+        - `[task_]getWorkingDir(ThreadNumber=4)`：
+        从远程服务器下载整个工作目录到本地，忽略 '.'，'_' 开头的文件和文件夹，
         注意如果远程服务器工作目录是 ssh 登录时的默认路径则不允许此操作
-        - `[task_]clearWorkingDir(ThreadNumber=4)`: 移除整个远程服务器的工作区，注意不忽略 '.'，'_' 开头的文件和文件夹，等价于 `rmdir(".")`，
+        - `[task_]clearWorkingDir(ThreadNumber=4)`：
+        移除整个远程服务器的工作区，注意不忽略 '.'，'_' 开头的文件和文件夹，等价于 `rmdir(".")`，
         注意如果远程服务器工作目录是 ssh 登录时的默认路径则不允许此操作
-    - **`pool(ThreadNumber)`**：获取一个可以并行执行指令的线程池，`ThreadNumber` 限制同时执行的数目。
-    此 pool 提供和 [Matlab-JavaThreadPool](https://github.com/CHanzyLazer/CSRC-AlloyDatabase) 中 `SystemThreadPool` 完全相同的接口，从而兼容其中的 `waitPools.m`
-        - `submitSystem(Command)`: 向线程池中提交指令
-        - `waitUntilDone()`: 挂起程序直到线程池中的任务全部完成
-        - `getTaskNumber()`: 获取线程池中剩余任务数目，即正在执行的任务以及正在排队的任务的总和
-        - `shutdown()`: 关闭内部的线程池，会等待所有任务完成
-        - `shutdownNow()`: 立刻关闭内部的线程池，不会等待任务完成
-- **`ServerSLURM`**: 专门对支持 SLURM 系统的服务器进行适配的终端，
-本身也提供了和 [Matlab-JavaThreadPool](https://github.com/CHanzyLazer/CSRC-AlloyDatabase) 中 `SystemThreadPool` 完全相同的接口
+    - **`pool(ThreadNumber)`**：
+    获取一个可以并行执行指令的线程池，`ThreadNumber` 限制同时执行的数目。此 pool 提供和 
+    [Matlab-JavaThreadPool](https://github.com/CHanzyLazer/CSRC-AlloyDatabase) 
+    中 `SystemThreadPool` 完全相同的接口，因此兼容其中的 `waitPools.m`
+        - `submitSystem(Command)`：
+        向线程池中提交指令
+        - `waitUntilDone()`：
+        挂起程序直到线程池中的任务全部完成
+        - `getTaskNumber()`：
+        获取线程池中剩余任务数目，即正在执行的任务以及正在排队的任务的总和
+        - `shutdown()`：
+        关闭内部的线程池，会等待所有任务完成
+        - `shutdownNow()`：
+        立刻关闭内部的线程池，不会等待任务完成
+- **`ServerSLURM`**：
+专门对支持 SLURM 系统的服务器进行适配的终端，本身也提供了和 
+[Matlab-JavaThreadPool](https://github.com/CHanzyLazer/CSRC-AlloyDatabase) 
+中 `SystemThreadPool` 完全相同的接口，因此兼容其中的 `waitPools.m`
     - **保存和加载**
-        - `save(FilePath)`：保存整个 slurm 端到 `FilePath`，包括正在执行的任务以及在排队的任务，保存为 json 格式，为了避免重复提交保存后设置 `pause` 暂停任务提交，
+        - `save(FilePath)`：
+        保存整个 slurm 端到 `FilePath`，包括正在执行的任务以及在排队的任务，保存为 json 格式，为了避免重复提交保存后设置 `pause` 暂停任务提交，
         **注意这个保存是没有加密，如果有密码则会保存明文的密码，需要保管好文件，如果在意可以使用密钥连接**。
         **不建议使用，同时 load 单个文件会出现重复提交的问题，并且内部没有进行检测所以难以发现，尽量使用 `setMirror` 保存**
-        - `load(FilePath)`：静态方法，从 `FilePath` 加载 slurm 端
-        - `setMirror(Path)`：设置此对象的本地镜像，之后任何改动都会同步到本地的镜像上。可以通过 `load` 来重新加载这个镜像来继续操作
+        - `load(FilePath)`：
+        静态方法，从 `FilePath` 加载 slurm 端
+        - `setMirror(Path)`：
+        设置此对象的本地镜像，之后任何改动都会同步到本地的镜像上。可以通过 `load` 来重新加载这个镜像来继续操作
     - **获取对象**
         - `get([SqueueName=username], MaxJobNumber, [MaxThisJobNumber=MaxJobNumber], LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], [Password])`：
         静态方法，获取 slurm 终端并且连接到终端，
@@ -240,47 +279,74 @@ suc = code.UT.tryTask(task, 3);
         - `getKey([SqueueName=username], MaxJobNumber, [MaxThisJobNumber=MaxJobNumber], LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], KeyPath)`：
         静态方法，获取 slurm 终端并且连接到终端，使用 `KeyPath` 位置的密钥进行认证
      - **参数设置**
-        - `setSleepTime(SleepTime)`：设置每轮提交任务或者检测任务完成情况的等待时间，单位 ms，默认为 500
-        - `setTolerant(Tolerant)`：设置提交任务失败的尝试次数，默认为 3，注意网络连接问题导致的失败不包括在内（即网络连接失败会一直尝试重新连接）。
+        - `setSleepTime(SleepTime)`：
+        设置每轮提交任务或者检测任务完成情况的等待时间，单位 ms，默认为 500
+        - `setTolerant(Tolerant)`：
+        设置提交任务失败的尝试次数，默认为 3，注意网络连接问题导致的失败不包括在内（即网络连接失败会一直尝试重新连接）。
         必须是出现相同的失败情况超过 Tolerant 次后才会取消这个任务的提交，因此有可能出现死循环
-        - `setMirror(Path)`：设置此对象的本地镜像，之后任何改动都会同步到本地的镜像上。可以通过 `load` 来重新加载这个镜像来继续操作
+        - `setMirror(Path)`：
+        设置此对象的本地镜像，之后任何改动都会同步到本地的镜像上。可以通过 `load` 来重新加载这个镜像来继续操作
    - **基本方法**
-        - `ssh()`: 返回内部的 `ServerSSH` 实例，通过此实现一般的 ssh 操作
-        - `shutdown()`: 断开连接并且关闭此 ssh 终端，不再允许其他操作，在此之前会等待提交的任全部完成
-        - `shutdownNow()`: 立刻断开连接并且关闭此 ssh 终端，不再允许其他操作，不会等待任务完成且会强行取消掉正在执行的任务
-        - `pause()`：暂停 slurm 端的任务提交以及任务完成情况的检测，如果正在提交任务会挂起程序直到提交完成，保证之后 slurm 端的任务队列不会发生改变
-        - `unpause()`：解除暂停
-        - `kill(Warning=true)`：直接杀死这个 slurm 端，类似于通过系统层面直接杀死（但是更加安全可控），会保留内部记录的正在执行的任务以及任务队列，
+        - `ssh()`：
+        返回内部的 `ServerSSH` 实例，通过此实现一般的 ssh 操作
+        - `shutdown()`：
+        断开连接并且关闭此 ssh 终端，不再允许其他操作，在此之前会等待提交的任全部完成
+        - `shutdownNow()`：
+        立刻断开连接并且关闭此 ssh 终端，不再允许其他操作，不会等待任务完成且会强行取消掉正在执行的任务
+        - `pause()`：
+        暂停 slurm 端的任务提交以及任务完成情况的检测，如果正在提交任务会挂起程序直到提交完成，保证之后 slurm 端的任务队列不会发生改变
+        - `unpause()`：
+        解除暂停
+        - `kill(Warning=true)`：
+        直接杀死这个 slurm 端，类似于通过系统层面直接杀死（但是更加安全可控），会保留内部记录的正在执行的任务以及任务队列，
         在没有设置镜像时执行会提示警告，关闭 `Warning` 可以抑制这个警告
     - **任务提交**
-        - `submitSystem([BeforeSystem], [AfterSystem], Command, [Partition], NodeNumber=1, OutputPath='.temp/slurm/out-%j')`: 
+        - `submitSystem([BeforeSystem], [AfterSystem], Command, [Partition], NodeNumber=1, OutputPath='.temp/slurm/out-%j')`：
         向 SLURM 服务器提交指令，相当于此指令写入了一个 bash 脚本并且使用 sbatch 来提交，
         输入 Task 对象来指定 `BeforeSystem` 和 `AfterSystem`，分别会在执行任务前和完成任务后执行这个 Task
-        - `submitBash([BeforeSystem], [AfterSystem], BashPath, [Partition], NodeNumber=1, OutputPath='.temp/slurm/out-%j')`: 
+        - `submitBash([BeforeSystem], [AfterSystem], BashPath, [Partition], NodeNumber=1, OutputPath='.temp/slurm/out-%j')`：
         向 SLURM 服务器直接提交 bash 脚本，相当于将本地的处于 `BashPath` 的脚本上传到远程服务器，然后使用 sbatch 来提交
-        - `submitSrun([BeforeSystem], [AfterSystem], Command, [Partition], TaskNumber=1, MaxTaskNumberPerNode=20, OutputPath='.temp/slurm/out-%j')`: 
+        - `submitSrun([BeforeSystem], [AfterSystem], Command, [Partition], TaskNumber=1, MaxTaskNumberPerNode=20, OutputPath='.temp/slurm/out-%j')`：
         向 SLURM 服务器直接提交 srun 指令，相当于在指令前增加一个 srun 并且写入 bash 脚本然后用sbatch 来提交，会根据输入自动计算需要的节点数目
-        - `submitSrunBash([BeforeSystem], [AfterSystem], BashPath, [Partition], TaskNumber=1, MaxTaskNumberPerNode=20, OutputPath='.temp/slurm/out-%j')`: 
+        - `submitSrunBash([BeforeSystem], [AfterSystem], BashPath, [Partition], TaskNumber=1, MaxTaskNumberPerNode=20, OutputPath='.temp/slurm/out-%j')`：
         向 SLURM 服务器直接提交 srun 运行的脚本，首先会将本地的处于 `BashPath` 的脚本上传到远程服务器，然后使用 srun 实行这个脚本，
         并且将此操作写入 bash 脚本然后使用 sbatch 来提交，会根据输入自动计算需要的节点数目
     - **实用方法**
-        - `jobNumber()`: 获取此用户在 SLURM 服务器上正在执行的任务数目
-        - `jobIDs()`: 获取此用户在 SLURM 服务器上正在执行的任务的编号
-        - `[task_]cancelAll()`: 取消此用户在 SLURM 服务器上正在执行的所有任务，即使这个任务不是通过这对象提交的。同时会清空此对象中排队的任务（如果有的话）
-        - `[task_]cancelThis()`: 取消这个对象提交的所有任务并且清空排队的任务
-        - `undo()`: 尝试取消最后一次提交的任务，如果在排队则取消成功返回对应的指令，如果已经提则取消失败，返回 null
-        - `getActiveCount()`: 获取正在执行的任务数目（仅限本对象提交的）
-        - `getQueueSize()`: 获取正在排队的任务数目
-        - `waitUntilDone()`: 挂起程序直到任务全部完成
-        - `getTaskNumber()`: 获取剩余任务数目，即 `getActiveCount() + getQueueSize()`
-        - `awaitTermination()`: 挂起直到内部线程池关闭（结合 `shutdown()` 使用）
-        - `getActiveJobIDs()`: 获取正在执行的任务编号（仅限本对象提交的）
-        - `getQueueCommands()`: 获取正在排队的指令列表
-- **`code.UT`**: 实用工具类
-    - `Pair`：在 java 中实现的类似于 c++ STL 中的 Pair 类
-    - `Task`：通过重写 `run` 方法将 ssh 和 slurm 中的一些操作封装成这个类，`run` 返回 `false` 或者报错都代表执行失败
-    - `mergeTask(Task1, Task2)`：静态方法，将两个 Task 合并成一个 Task，先执行 `Task1` 后执行 `Task2`，其中出现任何执行失败都会中断后续执行
-    - `tryTask(Task, [Tolerant])`：静态方法，尝试执行 `Task`，失败会返回 `false` 而不是报错，设置 `Tolerant` 会在失败后重新尝试执行 `Tolerant` 次
+        - `jobNumber()`：
+        获取此用户在 SLURM 服务器上正在执行的任务数目
+        - `jobIDs()`：
+        获取此用户在 SLURM 服务器上正在执行的任务的编号
+        - `[task_]cancelAll()`：
+        取消此用户在 SLURM 服务器上正在执行的所有任务，即使这个任务不是通过这对象提交的。同时会清空此对象中排队的任务（如果有的话）
+        - `[task_]cancelThis()`：
+        取消这个对象提交的所有任务并且清空排队的任务
+        - `undo()`：
+        尝试取消最后一次提交的任务，如果在排队则取消成功返回对应的指令，如果已经提则取消失败，返回 null
+        - `getActiveCount()`：
+        获取正在执行的任务数目（仅限本对象提交的）
+        - `getQueueSize()`：
+        获取正在排队的任务数目
+        - `waitUntilDone()`：
+        挂起程序直到任务全部完成
+        - `getTaskNumber()`：
+        获取剩余任务数目，即 `getActiveCount() + getQueueSize()`
+        - `awaitTermination()`：
+        挂起直到内部线程池关闭（结合 `shutdown()` 使用）
+        - `getActiveJobIDs()`：
+        获取正在执行的任务编号（仅限本对象提交的）
+        - `getQueueCommands()`：
+        获取正在排队的指令列表
+- **`code.UT`**：
+实用工具类
+    - `Pair`：
+    在 java 中实现的类似于 c++ STL 中的 Pair 类
+    - `Task`：
+    通过重写 `run` 方法将 `ServerSSH` 或 `ServerSLURM` 中的一些操作封装成这个类，`run` 返回 `false` 或者报错都代表执行失败
+    - `mergeTask(Task1, Task2)`：
+    静态方法，将两个 Task 合并成一个 Task，先执行 `Task1` 后执行 `Task2`，其中出现任何执行失败都会中断后续执行
+    - `tryTask(Task, [Tolerant])`：
+    静态方法，尝试执行 `Task`，失败会返回 `false` 而不是报错，设置 `Tolerant` 会在失败后重新尝试执行 `Tolerant` 次
+
 
 # 代码部分
 本项目使用 [Gradle](https://gradle.org/) 进行管理，在这里可以不安装 Gradle
