@@ -1,19 +1,25 @@
 package com.chanzy;
 
+import com.chanzy.code.Decryptor;
+import com.chanzy.code.Encryptor;
+import com.chanzy.code.UT;
 import com.jcraft.jsch.ChannelExec;
 import com.jcraft.jsch.JSchException;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
-import org.json.simple.parser.ParseException;
 
 import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-import static com.chanzy.code.UT.*;
+import static com.chanzy.code.UT.Pair;
+import static com.chanzy.code.UT.Task;
 
 /**
  * @author CHanzy
@@ -21,6 +27,7 @@ import static com.chanzy.code.UT.*;
  * 与 SSH 不同，可以把本身当作一个 SystemThreadPool
  * 相比 SSH 多一个 mMaxJobNumber 参数限制同时运行的任务数
  */
+@SuppressWarnings({"UnusedReturnValue", "BusyWait"})
 public final class ServerSLURM {
     static final int DEFAULT_TOLERANT = 3;
     
@@ -35,8 +42,6 @@ public final class ServerSLURM {
     private boolean mDead = false;
     private boolean mPause = false; // 可以暂停任务的提交
     private boolean mKilled = false; // 直接强制杀死提交进程
-    private boolean mSubmitting = false; // 记录是否正在提交
-    private boolean mNeedSaveMirror = false;
     
     private long mSleepTime = 500; // ms 设置更高的值可以降低检测的频率
     // 各种提交任务的尝试次数类
@@ -44,55 +49,60 @@ public final class ServerSLURM {
     // 保存提交的任务名称，不一定和真实的类名匹配（如果是 load 得到的）
     private String mJobName = "JOB-FROM-"+this;
     // 本地的镜像存储地址，会在任何修改后保存到此镜像
-    private String mMirrorPath = null;
+    private String mMirrorPath_ = null;
+    private String mMirrorPath = null; // 由于 matlab 下运行时绝对路径获取会出现问题，虽然已经内部实用已经没有问题，但是为了避免第三方库的问题这里本地目录统一实用绝对路径
+    // 镜像的加密密码
+    private String mMirrorKey = null;
+    // 远程服务器的镜像存储地址，用于检测是否有多个对象同时管理一个镜像
+    private String mRemoteMirrorPath = null;
     
     /// hooks, 修改这个来实现重写，我也不知道这个方法是不是合理
     // 发生内部参数改变都需要调用一下这个函数
-    Runnable doMemberChange = () -> {if (mMirrorPath != null) mNeedSaveMirror = true;};
-    // 内部使用的保存到镜像的方法
-    void saveToMirror_() {
-        if (!mNeedSaveMirror) return;
-        // 保存之前先检测 mirror 是否还是自己的，如果不是则需要 kill（但是这个改动已经发生，这是不可避免的）
-        boolean tMirrorValid = false;
-        try (FileReader tFile = new FileReader(mMirrorPath)) {
-            JSONObject tJson = (JSONObject) new JSONParser().parse(tFile);
-            tMirrorValid = ((JSONObject) tJson.get("SLURM")).get("MirrorOwner").equals(this.toString());
-        } catch (IOException | ParseException ignored) {}
-        if (!tMirrorValid) {
-            System.out.printf("WARNING: Exist redundant instance of mirror(%s),\n", this);
-            System.out.println("  which has been killed, but may still have some redundant submit,");
-            System.out.println("  you need to kill the old instance before load the mirror.");
-            System.out.flush();
-            mNeedSaveMirror = false;
-            kill();
-            return;
-        }
-        // 开始保存镜像
-        boolean oPause = mPause; // 记录原本的暂停状态
-        try {save(mMirrorPath);} catch (IOException ignored) {}
-        finally {mPause = oPause;} // 还原暂停状态（因为 save 会改变暂停状态，目前无论如何 save 都会完全暂停）
-        // 最后重置镜像保存需求
-        mNeedSaveMirror = false;
-    }
+    Runnable doMemberChange = this::saveToMirror_; // 这样可以使得任何修改都会实时存储，可以处理意外杀死的情况
     
     /// 保存到文件以及从文件加载
-    public void save(String aFilePath) throws IOException {
-        JSONObject rJson = new JSONObject();
-        save(rJson);
-        FileWriter tFile = new FileWriter(aFilePath);
-        JSONObject.writeJSONString(rJson, tFile);
-        tFile.close();
-    }
+    public void save(String aFilePath) throws Exception {save(aFilePath, null);}
     public static ServerSLURM load(String aFilePath) throws Exception {
+        aFilePath = UT.toAbsolutePath(aFilePath); // 同样需要处理相对路径的问题
         FileReader tFile = new FileReader(aFilePath);
         JSONObject tJson = (JSONObject) new JSONParser().parse(tFile);
         tFile.close();
         return load(tJson);
     }
+    // 带有密码的读写
+    @SuppressWarnings("ResultOfMethodCallIgnored")
+    public void save(String aFilePath, String aKey) throws Exception {
+        // 同样需要处理相对路径的问题
+        aFilePath = UT.toAbsolutePath(aFilePath);
+        // 保存到 json
+        JSONObject rJson = new JSONObject();
+        save(rJson);
+        // slurm 由于有自动保存的功能，需要先备份旧的文件
+        File tFile = new File(aFilePath);
+        if (tFile.exists()) Files.copy(tFile.toPath(), new File(aFilePath+".bak").toPath(), StandardCopyOption.REPLACE_EXISTING);
+        // 开始写入
+        if (aKey != null && !aKey.isEmpty()) {
+            Encryptor tEncryptor = new Encryptor(aKey);
+            Files.write(Paths.get(aFilePath), tEncryptor.getData(rJson.toJSONString()));
+        } else {
+            FileWriter tFileWriter = new FileWriter(aFilePath);
+            JSONObject.writeJSONString(rJson, tFileWriter);
+            tFileWriter.close();
+        }
+        // 写入完成删除备份文件
+        if (tFile.exists()) new File(aFilePath+".bak").delete();
+    }
+    public static ServerSLURM load(String aFilePath, String aKey) throws Exception {
+        aFilePath = UT.toAbsolutePath(aFilePath); // 同样需要处理相对路径的问题
+        Decryptor tDecryptor = new Decryptor(aKey);
+        JSONObject tJson = (JSONObject) new JSONParser().parse(tDecryptor.get(Files.readAllBytes(Paths.get(aFilePath))));
+        return load(tJson);
+    }
     // 偏向于内部使用的保存到 json 和从 json 读取
     @SuppressWarnings("unchecked")
-    public void save(JSONObject rJson) {
-        // 先暂停然后保存，防止保存过程中出现了修改
+    public synchronized void save(JSONObject rJson) {
+        // synchronized 修饰防止保存过程中出现了修改
+        // 保存需要暂停，防止重复提交
         pause();
         // 先保存 ssh
         JSONObject rJsonSSH = new JSONObject();
@@ -110,12 +120,13 @@ public final class ServerSLURM {
             rJsonSLURM.put("MaxThisJobNumber", mMaxThisJobNumber);
         if (!mSqueueName.equals(mSSH.session().getUserName()))
             rJsonSLURM.put("SqueueName", mSqueueName);
-        if (mMirrorPath != null) {
-            rJsonSLURM.put("MirrorPath", mMirrorPath);
-            rJsonSLURM.put("MirrorOwner", this.toString()); // 用来在 mirror 切换对象时防止重复提交
-        }
+        if (mMirrorPath_ != null)
+            rJsonSLURM.put("MirrorPath", mMirrorPath_);
+        if (mMirrorKey != null)
+            rJsonSLURM.put("MirrorKey", mMirrorKey);
+        if (mRemoteMirrorPath != null && !mRemoteMirrorPath.equals(".temp/mirror/"+mJobName))
+            rJsonSLURM.put("RemoteMirrorPath", mRemoteMirrorPath);
         
-        synchronized (mJobIDList) {
         if (!mJobIDList.isEmpty()) {
             JSONArray rJsonJobIDList = new JSONArray();
             rJsonSLURM.put("JobIDList", rJsonJobIDList);
@@ -125,9 +136,8 @@ public final class ServerSLURM {
                 Task tTask = tEntry.getValue().first;
                 rJsonJobIDList.add(tTask==null?Task.Type.NULL.name():tTask.toString());
             }
-        }}
+        }
         
-        synchronized (mCommandList) {
         if (!mCommandList.isEmpty()) {
             JSONArray rJsonCommandList = new JSONArray();
             rJsonSLURM.put("CommandList", rJsonCommandList);
@@ -139,7 +149,7 @@ public final class ServerSLURM {
                 rJsonCommandList.add(tBeforeTask==null?Task.Type.NULL.name():tBeforeTask.toString());
                 rJsonCommandList.add(tAfterTask==null?Task.Type.NULL.name():tAfterTask.toString());
             }
-        }}
+        }
         
         // save 操作不自动解除暂停以防止重复提交
     }
@@ -164,19 +174,23 @@ public final class ServerSLURM {
         rServerSLURM.mJobName = aJobName;
         
         // 获取任务队列
-        if (tJsonSLURM.containsKey("JobIDList")) synchronized (rServerSLURM.mJobIDList) {
+        if (tJsonSLURM.containsKey("JobIDList")) {
             JSONArray tJsonJobIDList = (JSONArray) tJsonSLURM.get("JobIDList");
             for (int i = 1; i < tJsonJobIDList.size(); i+=2)
                 rServerSLURM.mJobIDList.put(((Number) tJsonJobIDList.get(i-1)).intValue(), new Pair<>(Task.fromString(rServerSLURM, (String) tJsonJobIDList.get(i)), DEFAULT_TOLERANT));
         }
         // 获取排队队列
-        if (tJsonSLURM.containsKey("CommandList")) synchronized (rServerSLURM.mCommandList) {
+        if (tJsonSLURM.containsKey("CommandList")) {
             JSONArray tJsonCommandList = (JSONArray) tJsonSLURM.get("CommandList");
             for (int i = 2; i < tJsonCommandList.size(); i+=3)
                 rServerSLURM.mCommandList.add(new Pair<>(new Pair<>(Task.fromString(rServerSLURM, (String) tJsonCommandList.get(i-1)), Task.fromString(rServerSLURM, (String) tJsonCommandList.get(i))), (String) tJsonCommandList.get(i-2)));
         }
         // 最后加载 MirrorPath，会自动进行存储一次
-        if (tJsonSLURM.containsKey("MirrorPath")) rServerSLURM.setMirror((String) tJsonSLURM.get("MirrorPath"));
+        if (tJsonSLURM.containsKey("MirrorPath")) {
+            String tMirrorKey = tJsonSLURM.containsKey("MirrorKey") ? (String) tJsonSLURM.get("MirrorKey") : null;
+            if (!tJsonSLURM.containsKey("RemoteMirrorPath")) rServerSLURM.setMirror((String) tJsonSLURM.get("MirrorPath"), tMirrorKey);
+            else rServerSLURM.setMirror((String) tJsonSLURM.get("MirrorPath"), tMirrorKey, (String) tJsonSLURM.get("RemoteMirrorPath"));
+        }
         
         // 加载完成解除暂停
         rServerSLURM.unpause();
@@ -197,34 +211,108 @@ public final class ServerSLURM {
         // 提交长期任务，不断从 mCmdList 获取指令并执行
         mPool.execute(this::keepSubmitFromList_);
     }
-    // 不提供密码则认为是私钥登录，提供密码则认为是密码登录
-    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM getKey(int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM getKey(int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    // 不提供密码则认为是私钥登录，提供密码则认为是密码登录，可能存在歧义的情况则会有 getPassword 方法专门指明
+    public static ServerSLURM get        (int aMaxJobNumber, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
     
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
-    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
     
-    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM get   (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM getKey(int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
-    public static ServerSLURM getKey(int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
     
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM get   (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
-    public static ServerSLURM getKey(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    
+    
+    public static ServerSLURM get        (int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    
+    
+    public static ServerSLURM get        (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, tSSH.session().getUserName());}
+    
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aSqueueName);}
+    
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM get        (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getPassword(int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    public static ServerSLURM getKey     (int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, tSSH.session().getUserName());}
+    
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {ServerSSH tSSH = ServerSSH.get        (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname                  ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {ServerSSH tSSH = ServerSSH.get        (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort           ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM get        (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getPassword(String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {ServerSSH tSSH = ServerSSH.getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname,        aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
+    public static ServerSLURM getKey     (String aSqueueName, int aMaxJobNumber, int aMaxThisJobNumber, String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {ServerSSH tSSH = ServerSSH.getKey     (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath ); return new ServerSLURM(tSSH, aMaxJobNumber, aMaxThisJobNumber, aSqueueName);}
     /// 提供通用的接口，这里直接返回内部的 SSH 省去重复的转发部分
     public ServerSSH ssh() {
         if (mDead) throw new RuntimeException("Can NOT get SSH from a Dead SLURM.");
@@ -239,11 +327,8 @@ public final class ServerSLURM {
         mDead = true;
         mPool.shutdown();
     }
-    public void pause() {
-        mPause = true;
-        // 除了设置暂停，还会挂起直到这批任务提交完成（即等待直到真正暂停）
-        while (mSubmitting) try {Thread.sleep(200);} catch (InterruptedException e) {e.printStackTrace(); break;}
-    }
+    // 设置暂停，会挂起直到获得这个对象的锁，这样在外部调用后确实已经暂停，而在内部使用时不容易出现死锁
+    public synchronized void pause() {mPause = true;}
     public void unpause() {mPause = false;}
     // 直接杀死这个对象，类似于系统层面的杀死进程，会直接关闭提交任务并且放弃监管远程服务器的任务而不是取消这些任务，从而使得 mirror 的内容冻结
     public void kill() {kill(true);}
@@ -269,17 +354,32 @@ public final class ServerSLURM {
         mTolerantCounter.mUsedTolerant = Math.min(mTolerantCounter.mUsedTolerant, mTolerantCounter.mTolerant);
         doMemberChange.run(); return this;
     }
-    public ServerSLURM setMirror(String aPath) {
+    public ServerSLURM setMirrorRemote(String aPath, String aRemotePath) {return setMirror(aPath, null, aRemotePath);}
+    public ServerSLURM setMirror(String aPath) {return setMirror(aPath, null);}
+    public ServerSLURM setMirror(String aPath, String aKey) {return setMirror(aPath, aKey, ".temp/mirror/"+mJobName);}
+    public ServerSLURM setMirror(String aPath, String aKey, String aRemotePath) {
         if (mDead) throw new RuntimeException("Can NOT setMirror from a Dead SLURM.");
-        if (aPath.isEmpty()) {mMirrorPath = null; return this;}
-        mMirrorPath = aPath;
-        boolean oPause = mPause; // 记录原本的暂停状态
-        try {save(aPath);}
-        catch (IOException e) {
+        if (aPath.isEmpty()) {mMirrorPath_ = null; mMirrorPath = null; mRemoteMirrorPath = null; mMirrorKey = null; return this;}
+        // 存储参数
+        mMirrorPath_ = aPath;
+        mMirrorPath = UT.toAbsolutePath(aPath);
+        mMirrorKey = aKey;
+        if (aRemotePath.startsWith("~/")) aRemotePath = aRemotePath.substring(2); // JSch 不支持 ~
+        mRemoteMirrorPath = aRemotePath;
+        // 记录原本的暂停状态
+        boolean oPause = mPause;
+        // 尝试存储镜像文件
+        try {
+            save(aPath, aKey);
+            // 需要先让远程镜像所在的路径合法
+            Task tTask = task_validPath_(mRemoteMirrorPath);
+            if (tTask != null && !tTask.run()) throw new RuntimeException();
+            // 直接使用 echo 指令在远程服务器上创建镜像文件
+            mSSH.system(String.format("echo -e '%s\\nEND' > %s", this, mRemoteMirrorPath)); // 最后一行存 end 避免读取一半的情况
+        } catch (Exception e) {
             System.out.println("WARNING: set MirrorPath to "+aPath+" Fail, MirrorPath set to null.");
-            mMirrorPath = null;
-        }
-        finally {mPause = oPause;} // 还原暂停状态（因为 save 会改变暂停状态，目前无论如何 save 都会完全暂停）
+            mMirrorPath_ = null; mMirrorPath = null; mRemoteMirrorPath = null; mMirrorKey = null;
+        } finally {mPause = oPause;} // 还原暂停状态（因为 save 会改变暂停状态，目前无论如何 save 都会完全暂停）
         return this;
     }
     
@@ -287,26 +387,34 @@ public final class ServerSLURM {
     // 内部的从队列中提交任务
     void keepSubmitFromList_() {
         while (true) {
-            mSubmitting = false;
-            // 在这里执行保存到镜像的操作
-            saveToMirror_();
-            // 由于检测任务是否完成也需要发送指令，简单起见这里直接限制提交频率为 0.5s 一次（默认）
-            try {Thread.sleep(mSleepTime);} catch (InterruptedException e) {e.printStackTrace(); break;}
             // 如果被杀死则直接结束（优先级最高）
             if (mKilled) break;
+            // 由于检测任务是否完成也需要发送指令，简单起见这里直接限制提交频率为 0.5s 一次（默认）
+            try {Thread.sleep(mSleepTime);} catch (InterruptedException e) {e.printStackTrace(); break;}
             // 如果已经暂停则直接跳过
             if (mPause) continue;
-            // 开始提交任务相关事项，这里在任务提交完成之前都保持 mCommandList 和 mJobIDList 的占用，保证 getTaskNumber 一般会获得正确的值
-            synchronized (mCommandList) {synchronized (mJobIDList) {
-                mSubmitting = true;
+            // 开始提交任务相关事项，现在统一使用一个 this 锁来简化逻辑
+            synchronized(this) {
+                // 如果已经暂停则直接跳过，并行特有的两次检测
+                if (mPause) continue;
                 // 如果没有指令需要提交，并且没有正在执行的任务则需要考虑关闭线程
                 if (mCommandList.isEmpty() && mJobIDList.isEmpty()) {if (mDead) break; else continue;}
                 // 这里统一检查一次联机状态，如果重新连接失败直接跳过重试
                 if (!mSSH.isConnecting()) try {mSSH.connect();} catch (JSchException e) {continue;}
-                // 首先获取正在执行的任务队列
+                // 首先检测镜像是否合理
+                if (mMirrorPath != null) {
+                    final boolean[] tMirrorValid = {true}; boolean tCheckSuc = true;
+                    try {tMirrorValid[0] = checkMirror_();} catch (Exception e) {tCheckSuc = false;}
+                    mTolerantCounter.call(tCheckSuc, "check mirror: " + mRemoteMirrorPath, () -> tMirrorValid[0] = false);
+                    // 首先判断镜像非法，如果非法则直接执行非法并跳过后续（如果在容忍次数内会认为镜像合法）
+                    if (!tMirrorValid[0]) {doMirrorInvalid_(); continue;} // 现在在内部 kill 不会死锁了
+                    // 如果检测失败也会跳过后续（一般是网络会有问题）
+                    if (!tCheckSuc) continue;
+                }
+                // 获取正在执行的任务队列
                 Set<Integer> tJobIDs;
                 try {tJobIDs = jobIDs_();} catch (JSchException | IOException e) {continue;} // 获取失败则直接跳过重试
-                // 首先更新正在执行的任务列表
+                // 更新正在执行的任务列表
                 if (!mJobIDList.isEmpty()) {
                     // 将不存在 JobIDs 中的计数减一，因为可能因为网络问题导致 jobIDs_ 获取的结果不一定正确
                     for (Map.Entry<Integer, Pair<Task, Integer>> tEntry : mJobIDList.entrySet()) {
@@ -363,11 +471,8 @@ public final class ServerSLURM {
                 mCommandList.removeFirst();
                 mJobIDList.put(tJobID, new Pair<>(tTasks.second, DEFAULT_TOLERANT));
                 doMemberChange.run();
-            }}
+            }
         }
-        mSubmitting = false;
-        // 最后再执行一次保存到镜像的操作
-        saveToMirror_();
         // 最后关闭 SSH 通道
         mSSH.shutdown();
     }
@@ -397,6 +502,48 @@ public final class ServerSLURM {
         }
         return null;
     }
+    // 内部使用的保存到镜像的方法
+    void saveToMirror_() {
+        if (mMirrorPath == null) return;
+        boolean oPause = mPause; // 记录原本的暂停状态
+        try {save(mMirrorPath, mMirrorKey);} catch (Exception ignored) {}
+        finally {mPause = oPause;} // 还原暂停状态（因为 save 会改变暂停状态，目前无论如何 save 都会完全暂停）
+    }
+    // 内部使用的检测镜像是否合法的方法，成功检测到失败会返回 false，由于各种原因无法确定检测结果则抛出错误
+    boolean checkMirror_() throws JSchException, IOException, RuntimeException {
+        // 直接通过在远程服务器上执行 cat 指令来读取镜像
+        if (mMirrorPath == null || mRemoteMirrorPath == null) return true;
+        // systemChannel 内部已经尝试了重连
+        ChannelExec tChannelExec = mSSH.systemChannel(String.format("cat '%s'", mRemoteMirrorPath));
+        // 获取输出得到对应的镜像 owner
+        InputStream tIn = tChannelExec.getInputStream();
+        tChannelExec.connect();
+        BufferedReader tReader = new BufferedReader(new InputStreamReader(tIn));
+        LinkedList<String> tLines = new LinkedList<>();
+        String tLine;
+        while ((tLine = tReader.readLine()) != null) tLines.addLast(tLine);
+        // 读取完成关闭通道
+        tChannelExec.disconnect();
+        // 如果最后一行不是 END 说明输出流被打断或者不是标准镜像文件，不能确定是否合理，抛出异常
+        while (!tLines.isEmpty()) {
+            tLine = tLines.pollLast();
+            if (tLine.equals("END")) break;
+        }
+        if (tLine == null) throw new RuntimeException("Invalid RemoteMirrorPath format");
+        tLine = tLines.pollLast();
+        return tLine != null && tLine.equals(this.toString());
+    }
+    // 内部使用的，当镜像非法时的处理措施，kill 自身并且输出警告
+    void doMirrorInvalid_() {
+        System.out.printf("WARNING: The mirror of this instance(%s) is invalid,\n", this);
+        System.out.println("  so this instance has been killed, which may caused by the redundant instance of the mirror.");
+        System.out.println("  All of the instance of this mirror will be killed, so you may get repeated messages.");
+        System.out.println("  You need to kill the old instance before load the mirror.");
+        System.out.flush();
+        // 尝试设置远程的镜像非法，所有的冗余实例都会被杀死并收到杀死信息
+        try {mSSH.system(String.format("echo -e 'INVALID\\nEND' > %s", mRemoteMirrorPath));} catch (JSchException | IOException ignored) {}
+        kill();
+    }
     
     /**
      * 通用的提交任务接口，底层使用 sbatch 来提交任务
@@ -424,16 +571,44 @@ public final class ServerSLURM {
     public void submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand,                    int aNodeNumber, String aOutputPath) {submitSystem(aBeforeSystem, aAfterSystem, aCommand, null, aNodeNumber, aOutputPath);}
     public void submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition                                     ) {submitSystem(aBeforeSystem, aAfterSystem, aCommand, aPartition, 1);}
     public void submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aNodeNumber                    ) {submitSystem(aBeforeSystem, aAfterSystem, aCommand, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
-    public void submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aNodeNumber, String aOutputPath) {
+    
+    
+    public Task task_submitSystem(String aCommand                                                        ) {return task_submitSystem(aCommand, null);}
+    public Task task_submitSystem(String aCommand,                    int aNodeNumber                    ) {return task_submitSystem(aCommand, null, aNodeNumber);}
+    public Task task_submitSystem(String aCommand,                    int aNodeNumber, String aOutputPath) {return task_submitSystem(aCommand, null, aNodeNumber, aOutputPath);}
+    public Task task_submitSystem(String aCommand, String aPartition                                     ) {return task_submitSystem(aCommand, aPartition, 1);}
+    public Task task_submitSystem(String aCommand, String aPartition, int aNodeNumber                    ) {return task_submitSystem(aCommand, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
+    public Task task_submitSystem(String aCommand, String aPartition, int aNodeNumber, String aOutputPath) {return task_submitSystem(null, aCommand, aPartition, aNodeNumber, aOutputPath);}
+    
+    public Task task_submitSystem(Task aBeforeSystem, String aCommand                                                        ) {return task_submitSystem(aBeforeSystem, aCommand, null);}
+    public Task task_submitSystem(Task aBeforeSystem, String aCommand,                    int aNodeNumber                    ) {return task_submitSystem(aBeforeSystem, aCommand, null, aNodeNumber);}
+    public Task task_submitSystem(Task aBeforeSystem, String aCommand,                    int aNodeNumber, String aOutputPath) {return task_submitSystem(aBeforeSystem, aCommand, null, aNodeNumber, aOutputPath);}
+    public Task task_submitSystem(Task aBeforeSystem, String aCommand, String aPartition                                     ) {return task_submitSystem(aBeforeSystem, aCommand, aPartition, 1);}
+    public Task task_submitSystem(Task aBeforeSystem, String aCommand, String aPartition, int aNodeNumber                    ) {return task_submitSystem(aBeforeSystem, aCommand, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
+    public Task task_submitSystem(Task aBeforeSystem, String aCommand, String aPartition, int aNodeNumber, String aOutputPath) {return task_submitSystem(aBeforeSystem, null, aCommand, aPartition, aNodeNumber, aOutputPath);}
+    
+    public Task task_submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand                                                        ) {return task_submitSystem(aBeforeSystem, aAfterSystem, aCommand, null);}
+    public Task task_submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand,                    int aNodeNumber                    ) {return task_submitSystem(aBeforeSystem, aAfterSystem, aCommand, null, aNodeNumber);}
+    public Task task_submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand,                    int aNodeNumber, String aOutputPath) {return task_submitSystem(aBeforeSystem, aAfterSystem, aCommand, null, aNodeNumber, aOutputPath);}
+    public Task task_submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition                                     ) {return task_submitSystem(aBeforeSystem, aAfterSystem, aCommand, aPartition, 1);}
+    public Task task_submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aNodeNumber                    ) {return task_submitSystem(aBeforeSystem, aAfterSystem, aCommand, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
+    
+    
+    public Task task_submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aNodeNumber, String aOutputPath) {return new Task() {
+        @Override public boolean run() {submitSystem(aBeforeSystem, aAfterSystem, aCommand, aPartition, aNodeNumber, aOutputPath); return true;}
+        @Override public String toString() {return String.format("%s{%s:%s:%s:%s:%d:%s}", Type.SLURM_SUBMIT_SYSTEM.name(), aBeforeSystem==null?Type.NULL.name():aBeforeSystem.toString(), aAfterSystem==null?Type.NULL.name():aAfterSystem.toString(), aCommand, aPartition, aNodeNumber, aOutputPath);}
+    };}
+    public synchronized void submitSystem(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aNodeNumber, String aOutputPath) {
         if (mDead) throw new RuntimeException("Can NOT submitSbatch from a Dead SLURM.");
         aNodeNumber = Math.max(1, aNodeNumber);
         // 需要创建输出目录的文件夹
-        aBeforeSystem = mergeTask(aBeforeSystem, task_validPath_(aOutputPath));
+        aBeforeSystem = UT.mergeTask(aBeforeSystem, task_validPath_(aOutputPath));
         // 组装指令
         aCommand = String.format("echo -e '#!/bin/bash\\n%s' | sbatch --nodes %d --output %s --job-name %s", aCommand, aNodeNumber, aOutputPath, mJobName);
         if (aPartition != null && !aPartition.isEmpty()) aCommand += String.format(" --partition %s", aPartition);
         // 添加指令到队列
-        synchronized (mCommandList) {mCommandList.addLast(new Pair<>(new Pair<>(aBeforeSystem, aAfterSystem), aCommand)); doMemberChange.run();}
+        mCommandList.addLast(new Pair<>(new Pair<>(aBeforeSystem, aAfterSystem), aCommand));
+        doMemberChange.run();
     }
     
     /**
@@ -461,19 +636,47 @@ public final class ServerSLURM {
     public void submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath,                    int aNodeNumber, String aOutputPath) {submitBash(aBeforeSystem, aAfterSystem, aBashPath, null, aNodeNumber, aOutputPath);}
     public void submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition                                     ) {submitBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, -1);}
     public void submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aNodeNumber                    ) {submitBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
-    public void submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aNodeNumber, String aOutputPath) {
+    
+    
+    public Task task_submitBash(String aBashPath                                                        ) {return task_submitBash(aBashPath, null);}
+    public Task task_submitBash(String aBashPath,                    int aNodeNumber                    ) {return task_submitBash(aBashPath, null, aNodeNumber);}
+    public Task task_submitBash(String aBashPath,                    int aNodeNumber, String aOutputPath) {return task_submitBash(aBashPath, null, aNodeNumber, aOutputPath);}
+    public Task task_submitBash(String aBashPath, String aPartition                                     ) {return task_submitBash(aBashPath, aPartition, -1);}
+    public Task task_submitBash(String aBashPath, String aPartition, int aNodeNumber                    ) {return task_submitBash(aBashPath, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
+    public Task task_submitBash(String aBashPath, String aPartition, int aNodeNumber, String aOutputPath) {return task_submitBash(null, aBashPath, aPartition, aNodeNumber, aOutputPath);}
+    
+    public Task task_submitBash(Task aBeforeSystem, String aBashPath                                                        ) {return task_submitBash(aBeforeSystem, aBashPath, null);}
+    public Task task_submitBash(Task aBeforeSystem, String aBashPath,                    int aNodeNumber                    ) {return task_submitBash(aBeforeSystem, aBashPath, null, aNodeNumber);}
+    public Task task_submitBash(Task aBeforeSystem, String aBashPath,                    int aNodeNumber, String aOutputPath) {return task_submitBash(aBeforeSystem, aBashPath, null, aNodeNumber, aOutputPath);}
+    public Task task_submitBash(Task aBeforeSystem, String aBashPath, String aPartition                                     ) {return task_submitBash(aBeforeSystem, aBashPath, aPartition, -1);}
+    public Task task_submitBash(Task aBeforeSystem, String aBashPath, String aPartition, int aNodeNumber                    ) {return task_submitBash(aBeforeSystem, aBashPath, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
+    public Task task_submitBash(Task aBeforeSystem, String aBashPath, String aPartition, int aNodeNumber, String aOutputPath) {return task_submitBash(aBeforeSystem, null, aBashPath, aPartition, aNodeNumber, aOutputPath);}
+    
+    public Task task_submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath                                                        ) {return task_submitBash(aBeforeSystem, aAfterSystem, aBashPath, null);}
+    public Task task_submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath,                    int aNodeNumber                    ) {return task_submitBash(aBeforeSystem, aAfterSystem, aBashPath, null, aNodeNumber);}
+    public Task task_submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath,                    int aNodeNumber, String aOutputPath) {return task_submitBash(aBeforeSystem, aAfterSystem, aBashPath, null, aNodeNumber, aOutputPath);}
+    public Task task_submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition                                     ) {return task_submitBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, -1);}
+    public Task task_submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aNodeNumber                    ) {return task_submitBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, aNodeNumber, ".temp/slurm/out-%j");}
+    
+    
+    public Task task_submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aNodeNumber, String aOutputPath) {return new Task() {
+        @Override public boolean run() {submitBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, aNodeNumber, aOutputPath); return true;}
+        @Override public String toString() {return String.format("%s{%s:%s:%s:%s:%d:%s}", Type.SLURM_SUBMIT_BASH.name(), aBeforeSystem==null?Type.NULL.name():aBeforeSystem.toString(), aAfterSystem==null?Type.NULL.name():aAfterSystem.toString(), aBashPath, aPartition, aNodeNumber, aOutputPath);}
+    };}
+    public synchronized void submitBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aNodeNumber, String aOutputPath) {
         if (mDead) throw new RuntimeException("Can NOT submitBash from a Dead SLURM.");
         // 需要创建输出目录的文件夹
-        aBeforeSystem = mergeTask(aBeforeSystem, task_validPath_(aOutputPath));
+        aBeforeSystem = UT.mergeTask(aBeforeSystem, task_validPath_(aOutputPath));
         // 并且需要上传脚本
-        aBeforeSystem = mergeTask(aBeforeSystem, mSSH.task_putFile(aBashPath));
+        aBeforeSystem = UT.mergeTask(aBeforeSystem, mSSH.task_putFile(aBashPath));
         // 组装指令
         String tCommand = String.format("sbatch --output %s --job-name %s", aOutputPath, mJobName);
         if (aPartition != null && !aPartition.isEmpty()) tCommand += String.format(" --partition %s", aPartition);
         if (aNodeNumber > 0) tCommand += String.format(" --nodes %d", aNodeNumber);
         tCommand += String.format(" %s", aBashPath);
         // 添加指令到队列
-        synchronized (mCommandList) {mCommandList.addLast(new Pair<>(new Pair<>(aBeforeSystem, aAfterSystem), tCommand)); doMemberChange.run();}
+        mCommandList.addLast(new Pair<>(new Pair<>(aBeforeSystem, aAfterSystem), tCommand));
+        doMemberChange.run();
     }
     
     /**
@@ -506,6 +709,39 @@ public final class ServerSLURM {
     public void submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition                                                                ) {submitSrun(aBeforeSystem, aAfterSystem, aCommand, aPartition, 1);}
     public void submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aTaskNumber                                               ) {submitSrun(aBeforeSystem, aAfterSystem, aCommand, aPartition, aTaskNumber, 20);}
     public void submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode                    ) {submitSrun(aBeforeSystem, aAfterSystem, aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    
+    
+    public Task task_submitSrun(String aCommand                                                                                   ) {return task_submitSrun(aCommand, null);}
+    public Task task_submitSrun(String aCommand,                    int aTaskNumber                                               ) {return task_submitSrun(aCommand, null, aTaskNumber);}
+    public Task task_submitSrun(String aCommand,                    int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrun(aCommand, null, aTaskNumber, aMaxTaskNumberPerNode);}
+    public Task task_submitSrun(String aCommand,                    int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrun(aCommand, null, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    public Task task_submitSrun(String aCommand, String aPartition                                                                ) {return task_submitSrun(aCommand, aPartition, 1);}
+    public Task task_submitSrun(String aCommand, String aPartition, int aTaskNumber                                               ) {return task_submitSrun(aCommand, aPartition, aTaskNumber, 20);}
+    public Task task_submitSrun(String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrun(aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    public Task task_submitSrun(String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrun(null, aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    
+    public Task task_submitSrun(Task aBeforeSystem, String aCommand                                                                                   ) {return task_submitSrun(aBeforeSystem, aCommand, null);}
+    public Task task_submitSrun(Task aBeforeSystem, String aCommand,                    int aTaskNumber                                               ) {return task_submitSrun(aBeforeSystem, aCommand, null, aTaskNumber);}
+    public Task task_submitSrun(Task aBeforeSystem, String aCommand,                    int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrun(aBeforeSystem, aCommand, null, aTaskNumber, aMaxTaskNumberPerNode);}
+    public Task task_submitSrun(Task aBeforeSystem, String aCommand,                    int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrun(aBeforeSystem, aCommand, null, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    public Task task_submitSrun(Task aBeforeSystem, String aCommand, String aPartition                                                                ) {return task_submitSrun(aBeforeSystem, aCommand, aPartition, 1);}
+    public Task task_submitSrun(Task aBeforeSystem, String aCommand, String aPartition, int aTaskNumber                                               ) {return task_submitSrun(aBeforeSystem, aCommand, aPartition, aTaskNumber, 20);}
+    public Task task_submitSrun(Task aBeforeSystem, String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrun(aBeforeSystem, aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    public Task task_submitSrun(Task aBeforeSystem, String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrun(aBeforeSystem, null, aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    
+    public Task task_submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand                                                                                   ) {return task_submitSrun(aBeforeSystem, aAfterSystem, aCommand, null);}
+    public Task task_submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand,                    int aTaskNumber                                               ) {return task_submitSrun(aBeforeSystem, aAfterSystem, aCommand, null, aTaskNumber);}
+    public Task task_submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand,                    int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrun(aBeforeSystem, aAfterSystem, aCommand, null, aTaskNumber, aMaxTaskNumberPerNode);}
+    public Task task_submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand,                    int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrun(aBeforeSystem, aAfterSystem, aCommand, null, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    public Task task_submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition                                                                ) {return task_submitSrun(aBeforeSystem, aAfterSystem, aCommand, aPartition, 1);}
+    public Task task_submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aTaskNumber                                               ) {return task_submitSrun(aBeforeSystem, aAfterSystem, aCommand, aPartition, aTaskNumber, 20);}
+    public Task task_submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrun(aBeforeSystem, aAfterSystem, aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    
+    
+    public Task task_submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return new Task() {
+        @Override public boolean run() {submitSrun(aBeforeSystem, aAfterSystem, aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath); return true;}
+        @Override public String toString() {return String.format("%s{%s:%s:%s:%s:%d:%d:%s}", Type.SLURM_SUBMIT_SRUN.name(), aBeforeSystem==null?Type.NULL.name():aBeforeSystem.toString(), aAfterSystem==null?Type.NULL.name():aAfterSystem.toString(), aCommand, aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    };}
     public void submitSrun(Task aBeforeSystem, Task aAfterSystem, String aCommand, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {
         if (mDead) throw new RuntimeException("Can NOT submitSrun from a Dead SLURM.");
         aTaskNumber = Math.max(1, aTaskNumber);
@@ -543,10 +779,43 @@ public final class ServerSLURM {
     public void submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition                                                                ) {submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, 1);}
     public void submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aTaskNumber                                               ) {submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, aTaskNumber, 20);}
     public void submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode                    ) {submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    
+    
+    public Task task_submitSrunBash(String aBashPath                                                                                   ) {return task_submitSrunBash(aBashPath, null);}
+    public Task task_submitSrunBash(String aBashPath,                    int aTaskNumber                                               ) {return task_submitSrunBash(aBashPath, null, aTaskNumber);}
+    public Task task_submitSrunBash(String aBashPath,                    int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrunBash(aBashPath, null, aTaskNumber, aMaxTaskNumberPerNode);}
+    public Task task_submitSrunBash(String aBashPath,                    int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrunBash(aBashPath, null, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    public Task task_submitSrunBash(String aBashPath, String aPartition                                                                ) {return task_submitSrunBash(aBashPath, aPartition, 1);}
+    public Task task_submitSrunBash(String aBashPath, String aPartition, int aTaskNumber                                               ) {return task_submitSrunBash(aBashPath, aPartition, aTaskNumber, 20);}
+    public Task task_submitSrunBash(String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrunBash(aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    public Task task_submitSrunBash(String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrunBash(null, aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    
+    public Task task_submitSrunBash(Task aBeforeSystem, String aBashPath                                                                                   ) {return task_submitSrunBash(aBeforeSystem, aBashPath, null);}
+    public Task task_submitSrunBash(Task aBeforeSystem, String aBashPath,                    int aTaskNumber                                               ) {return task_submitSrunBash(aBeforeSystem, aBashPath, null, aTaskNumber);}
+    public Task task_submitSrunBash(Task aBeforeSystem, String aBashPath,                    int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrunBash(aBeforeSystem, aBashPath, null, aTaskNumber, aMaxTaskNumberPerNode);}
+    public Task task_submitSrunBash(Task aBeforeSystem, String aBashPath,                    int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrunBash(aBeforeSystem, aBashPath, null, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    public Task task_submitSrunBash(Task aBeforeSystem, String aBashPath, String aPartition                                                                ) {return task_submitSrunBash(aBeforeSystem, aBashPath, aPartition, 1);}
+    public Task task_submitSrunBash(Task aBeforeSystem, String aBashPath, String aPartition, int aTaskNumber                                               ) {return task_submitSrunBash(aBeforeSystem, aBashPath, aPartition, aTaskNumber, 20);}
+    public Task task_submitSrunBash(Task aBeforeSystem, String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrunBash(aBeforeSystem, aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    public Task task_submitSrunBash(Task aBeforeSystem, String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrunBash(aBeforeSystem, null, aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    
+    public Task task_submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath                                                                                   ) {return task_submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, null);}
+    public Task task_submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath,                    int aTaskNumber                                               ) {return task_submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, null, aTaskNumber);}
+    public Task task_submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath,                    int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, null, aTaskNumber, aMaxTaskNumberPerNode);}
+    public Task task_submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath,                    int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return task_submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, null, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    public Task task_submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition                                                                ) {return task_submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, 1);}
+    public Task task_submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aTaskNumber                                               ) {return task_submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, aTaskNumber, 20);}
+    public Task task_submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode                    ) {return task_submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, ".temp/slurm/out-%j");}
+    
+    
+    public Task task_submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {return new Task() {
+        @Override public boolean run() {submitSrunBash(aBeforeSystem, aAfterSystem, aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath); return true;}
+        @Override public String toString() {return String.format("%s{%s:%s:%s:%s:%d:%d:%s}", Type.SLURM_SUBMIT_SRUN_BASH.name(), aBeforeSystem==null?Type.NULL.name():aBeforeSystem.toString(), aAfterSystem==null?Type.NULL.name():aAfterSystem.toString(), aBashPath, aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);}
+    };}
     public void submitSrunBash(Task aBeforeSystem, Task aAfterSystem, String aBashPath, String aPartition, int aTaskNumber, int aMaxTaskNumberPerNode, String aOutputPath) {
         if (mDead) throw new RuntimeException("Can NOT submitSrunBash from a Dead SLURM.");
         // 需要上传脚本
-        aBeforeSystem = mergeTask(aBeforeSystem, mSSH.task_putFile(aBashPath));
+        aBeforeSystem = UT.mergeTask(aBeforeSystem, mSSH.task_putFile(aBashPath));
         // 提交命令
         submitSrun(aBeforeSystem, aAfterSystem, String.format("bash %s", aBashPath), aPartition, aTaskNumber, aMaxTaskNumberPerNode, aOutputPath);
     }
@@ -576,61 +845,51 @@ public final class ServerSLURM {
     // 取消这个用户所有的任务
     public Task task_cancelAll() {return new Task() {
         @Override public boolean run() throws Exception {cancelAll(); return true;}
-        @Override public String toString() {return Type.CANCEL_ALL.name();}
+        @Override public String toString() {return Type.SLURM_CANCEL_ALL.name();}
     };}
-    public void cancelAll() throws JSchException, IOException {
+    public synchronized void cancelAll() throws JSchException, IOException {
         if (mDead) throw new RuntimeException("Can NOT cancelAll from a Dead SLURM.");
-        synchronized(mCommandList) {mCommandList.clear(); doMemberChange.run();}
+        mCommandList.clear(); doMemberChange.run();
         mSSH.system(String.format("scancel --user %s --full", mSqueueName));
-        synchronized(mJobIDList) {mJobIDList.clear(); doMemberChange.run();}
+        mJobIDList.clear(); doMemberChange.run();
     }
     
     // 取消这个对象一共提交的所有任务
     public Task task_cancelThis() {return new Task() {
         @Override public boolean run() throws Exception {cancelThis(); return true;}
-        @Override public String toString() {return Type.CANCEL_THIS.name();}
+        @Override public String toString() {return Type.SLURM_CANCEL_THIS.name();}
     };}
-    public void cancelThis() throws JSchException, IOException {
+    public synchronized void cancelThis() throws JSchException, IOException {
         if (mDead) throw new RuntimeException("Can NOT cancelThis from a Dead SLURM.");
-        synchronized(mCommandList) {mCommandList.clear(); doMemberChange.run();}
-        boolean tIsJobEmpty;
-        synchronized(mJobIDList) {tIsJobEmpty = mJobIDList.isEmpty();}
-        if (!tIsJobEmpty) {
-            mSSH.system(String.format("scancel --name %s", mJobName));
-            synchronized(mJobIDList) {mJobIDList.clear(); doMemberChange.run();}
-        }
+        mCommandList.clear(); doMemberChange.run();
+        mSSH.system(String.format("scancel --name %s", mJobName));
+        mJobIDList.clear(); doMemberChange.run();
     }
     
     // 撤销上一步提交的任务（如果已经交上去则会失败）
-    public Pair<Pair<Task, Task>, String> undo() {
+    public synchronized Pair<Pair<Task, Task>, String> undo() {
         Pair<Pair<Task, Task>, String> tCommand;
-        synchronized (mCommandList) {tCommand = mCommandList.pollLast(); doMemberChange.run();}
+        tCommand = mCommandList.pollLast(); doMemberChange.run();
         return tCommand;
     }
     
     /// 提供 SystemThreadPool 的相关接口
-    public int getActiveCount() {int tActiveCount; synchronized(mJobIDList) {tActiveCount = mJobIDList.size();} return tActiveCount;}
-    public int getQueueSize() {int tQueueSize; synchronized(mCommandList) {tQueueSize = mCommandList.size();} return tQueueSize;}
+    public synchronized int getActiveCount() {return mJobIDList.size();}
+    public synchronized int getQueueSize() {return mCommandList.size();}
     public void waitUntilDone() throws InterruptedException {while (getActiveCount() > 0 || getQueueSize() > 0) Thread.sleep(200);}
     public int getTaskNumber() {return getActiveCount() + getQueueSize();}
     
     public boolean awaitTermination() throws InterruptedException {return mPool.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);}
-    public int[] getActiveJobIDs() {
-        int[] tJobIDs;
-        synchronized(mJobIDList) {
-            tJobIDs = new int[mJobIDList.size()];
-            int i = 0;
-            for (int tJobID : mJobIDList.keySet()) {tJobIDs[i] = tJobID; ++i;}
-        }
+    public synchronized int[] getActiveJobIDs() {
+        int[] tJobIDs = new int[mJobIDList.size()];
+        int i = 0;
+        for (int tJobID : mJobIDList.keySet()) {tJobIDs[i] = tJobID; ++i;}
         return tJobIDs;
     }
-    public String[] getQueueCommands() {
-        String[] tCommands;
-        synchronized(mCommandList) {
-            tCommands = new String[mCommandList.size()];
-            int i = 0;
-            for (Pair<Pair<Task, Task>, String> tPair : mCommandList) {tCommands[i] = tPair.second; ++i;}
-        }
+    public synchronized String[] getQueueCommands() {
+        String[] tCommands = new String[mCommandList.size()];
+        int i = 0;
+        for (Pair<Pair<Task, Task>, String> tPair : mCommandList) {tCommands[i] = tPair.second; ++i;}
         return tCommands;
     }
     
@@ -658,4 +917,7 @@ public final class ServerSLURM {
             }
         }
     }
+    
+    // 手动加载 UT，会自动重新设置工作目录，会在调用静态函数 get 或者 load 时自动加载保证路径的正确性
+    static {UT.init();}
 }

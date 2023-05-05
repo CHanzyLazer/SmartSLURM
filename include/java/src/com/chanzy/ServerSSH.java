@@ -1,17 +1,22 @@
 package com.chanzy;
 
+import com.chanzy.code.Decryptor;
+import com.chanzy.code.Encryptor;
+import com.chanzy.code.UT;
 import com.jcraft.jsch.*;
 import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
 
 import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Vector;
 import java.util.concurrent.*;
 
-import static com.chanzy.code.UT.*;
+import static com.chanzy.code.UT.Task;
 
 /**
  * @author CHanzy
@@ -22,9 +27,12 @@ import static com.chanzy.code.UT.*;
  * 由于免密登录只支持经典的 openssh 密钥（即需要生成时加上 -m pem），因此还提供密码登录的支持
  * 依旧不建议使用密码登录，因为会在代码中出现明文密码
  */
+@SuppressWarnings({"UnusedReturnValue", "BusyWait"})
 public final class ServerSSH {
-    // 本地和远程的工作目录，绝对路径，用 matlab 调用时不能正确获取工作目录
-    String mLocalWorkingDir;
+    // 本地和远程的工作目录
+    private String mLocalWorkingDir_;
+    private String mRemoteWorkingDir_;
+    String mLocalWorkingDir; // 由于 matlab 下运行时绝对路径获取会出现问题，虽然已经内部实用已经没有问题，但是为了避免第三方库的问题这里本地目录统一使用绝对路径
     String mRemoteWorkingDir;
     // jsch stuffs
     final JSch mJsch;
@@ -44,6 +52,7 @@ public final class ServerSSH {
     
     /// 保存到文件以及从文件加载
     public void save(String aFilePath) throws IOException {
+        aFilePath = UT.toAbsolutePath(aFilePath); // 同样需要处理相对路径的问题
         JSONObject rJson = new JSONObject();
         save(rJson);
         FileWriter tFile = new FileWriter(aFilePath);
@@ -51,9 +60,24 @@ public final class ServerSSH {
         tFile.close();
     }
     public static ServerSSH load(String aFilePath) throws Exception {
+        aFilePath = UT.toAbsolutePath(aFilePath); // 同样需要处理相对路径的问题
         FileReader tFile = new FileReader(aFilePath);
         JSONObject tJson = (JSONObject) new JSONParser().parse(tFile);
         tFile.close();
+        return load(tJson);
+    }
+    // 带有密码的读写
+    public void save(String aFilePath, String aKey) throws Exception {
+        aFilePath = UT.toAbsolutePath(aFilePath); // 同样需要处理相对路径的问题
+        JSONObject rJson = new JSONObject();
+        save(rJson);
+        Encryptor tEncryptor = new Encryptor(aKey);
+        Files.write(Paths.get(aFilePath), tEncryptor.getData(rJson.toJSONString()));
+    }
+    public static ServerSSH load(String aFilePath, String aKey) throws Exception {
+        aFilePath = UT.toAbsolutePath(aFilePath); // 同样需要处理相对路径的问题
+        Decryptor tDecryptor = new Decryptor(aKey);
+        JSONObject tJson = (JSONObject) new JSONParser().parse(tDecryptor.get(Files.readAllBytes(Paths.get(aFilePath))));
         return load(tJson);
     }
     // 偏向于内部使用的保存到 json 和从 json 读取
@@ -63,10 +87,10 @@ public final class ServerSSH {
         rJson.put("Hostname", session().getHost());
         rJson.put("Port", session().getPort());
         
-        if (!mLocalWorkingDir.isEmpty() && !mLocalWorkingDir.equals(System.getProperty("user.home")+"/"))
-            rJson.put("LocalWorkingDir", mLocalWorkingDir);
-        if (!mRemoteWorkingDir.isEmpty())
-            rJson.put("RemoteWorkingDir", mRemoteWorkingDir);
+        if (!mLocalWorkingDir_.isEmpty())
+            rJson.put("LocalWorkingDir", mLocalWorkingDir_);
+        if (!mRemoteWorkingDir_.isEmpty())
+            rJson.put("RemoteWorkingDir", mRemoteWorkingDir_);
         if (mPassword!=null)
             rJson.put("Password", mPassword);
         if (mKeyPath!=null && !mKeyPath.isEmpty() && !mKeyPath.equals(System.getProperty("user.home")+"/.ssh/id_rsa"))
@@ -92,12 +116,12 @@ public final class ServerSSH {
         if (aJson.containsKey("RemoteWorkingDir")) aRemoteWorkingDir = (String) aJson.get("RemoteWorkingDir");
         if (aJson.containsKey("Password"))         aPassword         = (String) aJson.get("Password");
         if (aJson.containsKey("KeyPath"))          aKeyPath          = (String) aJson.get("KeyPath");
-    
+        
         ServerSSH rServerSSH;
-        if (aPassword!=null) rServerSSH = get(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword);
+        if (aPassword!=null) rServerSSH = getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword);
         else if (aKeyPath!=null) rServerSSH = getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath);
         else rServerSSH = get(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort);
-    
+        
         if (aJson.containsKey("CompressLevel")) rServerSSH.setCompressionLevel(((Number) aJson.get("CompressLevel")).intValue());
         if (aJson.containsKey("BeforeCommand")) rServerSSH.setBeforeSystem((String) aJson.get("BeforeCommand"));
         
@@ -110,11 +134,29 @@ public final class ServerSSH {
         try {mSession = mJsch.getSession(aUsername, aHostname, aPort);} catch (JSchException e) {throw new RuntimeException(e);}
         session().setConfig("StrictHostKeyChecking", "no");
     }
-    // 不提供密码则认为是私钥登录，提供密码则认为是密码登录
-    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {return get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22);}
-    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {return getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, System.getProperty("user.home")+"/.ssh/id_rsa");}
-    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {return get   (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22, aPassword);}
-    public static ServerSSH get(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {
+    // 不提供密码则认为是私钥登录，提供密码则认为是密码登录，可能存在歧义的情况则会有 getPassword 方法专门指明
+    public static ServerSSH get        (String aUsername, String aHostname                             ) {return get        (aUsername, aHostname, 22);}
+    public static ServerSSH get        (String aUsername, String aHostname, int aPort                  ) {return getKey     (aUsername, aHostname, aPort, System.getProperty("user.home")+"/.ssh/id_rsa");}
+    public static ServerSSH get        (String aUsername, String aHostname, int aPort, String aPassword) {return getPassword(aUsername, aHostname, aPort, aPassword);}
+    public static ServerSSH getPassword(String aUsername, String aHostname,            String aPassword) {return getPassword(aUsername, aHostname, 22, aPassword);}
+    public static ServerSSH getPassword(String aUsername, String aHostname, int aPort, String aPassword) {return getPassword(null, aUsername, aHostname, aPort, aPassword);}
+    public static ServerSSH getKey     (String aUsername, String aHostname,            String aKeyPath ) {return getKey     (aUsername, aHostname, 22, aKeyPath);}
+    public static ServerSSH getKey     (String aUsername, String aHostname, int aPort, String aKeyPath ) {return getKey     (null, aUsername, aHostname, aPort, aKeyPath);}
+    
+    public static ServerSSH get        (String aRemoteWorkingDir, String aUsername, String aHostname                             ) {return get        (aRemoteWorkingDir, aUsername, aHostname, 22);}
+    public static ServerSSH get        (String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {return getKey     (aRemoteWorkingDir, aUsername, aHostname, aPort, System.getProperty("user.home")+"/.ssh/id_rsa");}
+    public static ServerSSH get        (String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {return getPassword(aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword);}
+    public static ServerSSH getPassword(String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {return getPassword(aRemoteWorkingDir, aUsername, aHostname, 22, aPassword);}
+    public static ServerSSH getPassword(String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {return getPassword(null, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword);}
+    public static ServerSSH getKey     (String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath ) {return getKey     (aRemoteWorkingDir, aUsername, aHostname, 22, aKeyPath);}
+    public static ServerSSH getKey     (String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath ) {return getKey     (null, aRemoteWorkingDir, aUsername, aHostname, aPort, aKeyPath);}
+    
+    public static ServerSSH get        (String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname                             ) {return get        (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22);}
+    public static ServerSSH get        (String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort                  ) {return getKey     (aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, System.getProperty("user.home")+"/.ssh/id_rsa");}
+    public static ServerSSH get        (String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {return getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPassword);}
+    public static ServerSSH get        (String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {return getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, aPort, aPassword);}
+    public static ServerSSH getPassword(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aPassword) {return getPassword(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22, aPassword);}
+    public static ServerSSH getPassword(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aPassword) {
         ServerSSH rServerSSH = new ServerSSH(aUsername, aHostname, aPort).setLocalWorkingDir(aLocalWorkingDir).setRemoteWorkingDir(aRemoteWorkingDir);
         rServerSSH.mSession.setPassword(aPassword);
         rServerSSH.mPassword = aPassword;
@@ -122,8 +164,8 @@ public final class ServerSSH {
         try {rServerSSH.mSession.connect();} catch (JSchException e) {e.printStackTrace();}
         return rServerSSH;
     }
-    public static ServerSSH getKey(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath) {return getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22, aKeyPath);}
-    public static ServerSSH getKey(String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath) {
+    public static ServerSSH getKey     (String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname,            String aKeyPath) {return getKey(aLocalWorkingDir, aRemoteWorkingDir, aUsername, aHostname, 22, aKeyPath);}
+    public static ServerSSH getKey     (String aLocalWorkingDir, String aRemoteWorkingDir, String aUsername, String aHostname, int aPort, String aKeyPath) {
         ServerSSH rServerSSH = new ServerSSH(aUsername, aHostname, aPort).setLocalWorkingDir(aLocalWorkingDir).setRemoteWorkingDir(aRemoteWorkingDir);
         try {rServerSSH.mJsch.addIdentity(aKeyPath);} catch (JSchException e) {e.printStackTrace();}
         rServerSSH.mKeyPath = aKeyPath;
@@ -134,8 +176,10 @@ public final class ServerSSH {
     // 修改本地路径和远程路径
     public ServerSSH setLocalWorkingDir(String aLocalWorkingDir) {
         if (mDead) throw new RuntimeException("Can NOT setLocalWorkingDir from a Dead SSH.");
-        if (aLocalWorkingDir == null || aLocalWorkingDir.isEmpty()) aLocalWorkingDir = System.getProperty("user.home")+"/";
-        if (!aLocalWorkingDir.endsWith("/") && !aLocalWorkingDir.endsWith("\\")) aLocalWorkingDir += "/";
+        if (aLocalWorkingDir == null) aLocalWorkingDir = "";
+        mLocalWorkingDir_ = aLocalWorkingDir;
+        aLocalWorkingDir = UT.toAbsolutePath(aLocalWorkingDir);
+        if (!aLocalWorkingDir.isEmpty() && !aLocalWorkingDir.endsWith("/") && !aLocalWorkingDir.endsWith("\\")) aLocalWorkingDir += "/";
         mLocalWorkingDir = aLocalWorkingDir;
         doMemberChange.run();
         return this;
@@ -143,6 +187,7 @@ public final class ServerSSH {
     public ServerSSH setRemoteWorkingDir(String aRemoteWorkingDir) {
         if (mDead) throw new RuntimeException("Can NOT setRemoteWorkingDir from a Dead SSH.");
         if (aRemoteWorkingDir == null) aRemoteWorkingDir = "";
+        mRemoteWorkingDir_ = aRemoteWorkingDir;
         if (!aRemoteWorkingDir.isEmpty() && !aRemoteWorkingDir.endsWith("/") && !aRemoteWorkingDir.endsWith("\\")) aRemoteWorkingDir += "/";
         if (aRemoteWorkingDir.startsWith("~/")) aRemoteWorkingDir = aRemoteWorkingDir.substring(2); // JSch 不支持 ~
         mRemoteWorkingDir = aRemoteWorkingDir;
@@ -200,6 +245,7 @@ public final class ServerSSH {
     }
     
     /// 基本方法
+    @SuppressWarnings("BooleanMethodIsAlwaysInverted")
     public boolean isConnecting() {return session().isConnected();}
     // 整个 connect 过程都需要同步，避免连接到一半其他线程获取到非法的 session
     public synchronized void connect() throws JSchException {
@@ -273,7 +319,7 @@ public final class ServerSSH {
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
         // 递归子文件夹传输文件
         (new RecurseLocalDir(this, aDir) {
-            @Override public boolean initRemoteDir(String aRemoteDir) {return mkdir_(tChannelSftp, aRemoteDir);}
+            @Override public boolean initRemoteDir(String aRemoteDir) {return makeDir_(tChannelSftp, aRemoteDir);}
             @Override public void doFile(File aLocalFile, String aRemoteDir) {try {tChannelSftp.put(aLocalFile.getPath(), aRemoteDir);} catch (SftpException ignored) {}}
         }).run();
         // 最后关闭通道
@@ -323,11 +369,13 @@ public final class ServerSSH {
         tChannelSftp.disconnect();
     }
     // 递归删除远程服务器的文件夹
-    public Task task_rmdir(final String aDir) {return new Task() {
+    public Task task_rmdir(final String aDir) {return task_removeDir(aDir);}
+    public Task task_removeDir(final String aDir) {return new Task() {
         @Override public boolean run() throws Exception {rmdir(aDir); return true;}
-        @Override public String toString() {return String.format("%s{%s}", Type.RMDIR.name(), aDir);}
+        @Override public String toString() {return String.format("%s{%s}", Type.REMOVE_DIR.name(), aDir);}
     };}
-    public void rmdir(String aDir) throws JSchException {
+    public void rmdir(String aDir) throws JSchException {removeDir(aDir);}
+    public void removeDir(String aDir) throws JSchException {
         if (mDead) throw new RuntimeException("Can NOT rmdir from a Dead SSH.");
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
@@ -345,11 +393,13 @@ public final class ServerSSH {
         tChannelSftp.disconnect();
     }
     // 在远程服务器创建文件夹，支持跨文件夹创建文件夹。不同于一般的 mkdir，这里如果原本的目录存在会返回 true
-    public Task task_mkdir(final String aDir) {return new Task() {
+    public Task task_mkdir(final String aDir) {return task_makeDir(aDir);}
+    public Task task_makeDir(final String aDir) {return new Task() {
         @Override public boolean run() throws Exception {return mkdir(aDir);}
-        @Override public String toString() {return String.format("%s{%s}", Type.MKDIR.name(), aDir);}
+        @Override public String toString() {return String.format("%s{%s}", Type.MAKE_DIR.name(), aDir);}
     };}
-    public boolean mkdir(String aDir) throws JSchException {
+    public boolean mkdir(String aDir) throws JSchException {return makeDir(aDir);}
+    public boolean makeDir(String aDir) throws JSchException {
         if (mDead) throw new RuntimeException("Can NOT mkdir from a Dead SSH.");
         // 会尝试一次重新连接
         if (!isConnecting()) connect();
@@ -360,7 +410,7 @@ public final class ServerSSH {
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
         String tRemoteDir = mRemoteWorkingDir+aDir;
         // 创建文件夹
-        boolean tSuc = mkdir_(tChannelSftp, tRemoteDir);
+        boolean tSuc = makeDir_(tChannelSftp, tRemoteDir);
         // 最后关闭通道
         tChannelSftp.disconnect();
         return tSuc;
@@ -401,7 +451,7 @@ public final class ServerSSH {
         int tEndIdx = aFilePath.lastIndexOf("/");
         if (tEndIdx > 0) { // 否则不用创建，认为 mRemoteWorkingDir 已经存在
             tRemoteDir += aFilePath.substring(0, tEndIdx+1);
-            if (!ServerSSH.mkdir_(tChannelSftp, tRemoteDir)) throw new RuntimeException("Fail when create remote dir: "+tRemoteDir);
+            if (!ServerSSH.makeDir_(tChannelSftp, tRemoteDir)) throw new RuntimeException("Fail when create remote dir: " + tRemoteDir);
         }
         // 上传脚本
         tChannelSftp.put(tLocalFile.getPath(), tRemoteDir);
@@ -468,7 +518,7 @@ public final class ServerSSH {
         if (!aDir.isEmpty() && !aDir.endsWith("/")) aDir += "/";
         // 递归子文件夹传输文件
         (new RecurseLocalDir(this, aDir) {
-            @Override public boolean initRemoteDir(String aRemoteDir) {return mkdir_(tChannelSftp, aRemoteDir);}
+            @Override public boolean initRemoteDir(String aRemoteDir) {return makeDir_(tChannelSftp, aRemoteDir);}
             @Override public void doFile(File aLocalFile, String aRemoteDir) {tSftpPool.submit(aChannelSftp -> {try {aChannelSftp.put(aLocalFile.getPath(), aRemoteDir);} catch (SftpException ignored) {}});}
         }).run();
         // 最后关闭通道
@@ -535,8 +585,8 @@ public final class ServerSSH {
     public void putWorkingDir() throws JSchException, InterruptedException {putWorkingDir(4);}
     public void putWorkingDir(int aThreadNumber) throws JSchException, InterruptedException {
         if (mDead) throw new RuntimeException("Can NOT putWorkingDir from a Dead SSH.");
-        // 如果本地目录是默认值则不允许此操作
-        if (mLocalWorkingDir.isEmpty() || mLocalWorkingDir.equals(System.getProperty("user.home")+"/")) throw new RuntimeException("Can NOT putWorkingDir when LocalWorkingDir is: \""+mLocalWorkingDir+"\"");
+        // 如果本地目录是用户目录（获取工作目录失败）则禁止此操作
+        if (UT.samePath(mLocalWorkingDir, System.getProperty("user.home")) || mLocalWorkingDir.equals("/")) throw new RuntimeException("Can NOT putWorkingDir when LocalWorkingDir is: \""+mLocalWorkingDir+"\"");
         // 创建并发线程池，会自动尝试重新连接
         final SftpPool tSftpPool = new SftpPool(this, aThreadNumber);
         // 获取文件传输通道，还是需要一个专门的频道来串行执行创建文件夹
@@ -544,7 +594,7 @@ public final class ServerSSH {
         tChannelSftp.connect();
         // 递归子文件夹传输文件
         (new RecurseLocalDir(this, "") {
-            @Override public boolean initRemoteDir(String aRemoteDir) {return mkdir_(tChannelSftp, aRemoteDir);}
+            @Override public boolean initRemoteDir(String aRemoteDir) {return makeDir_(tChannelSftp, aRemoteDir);}
             @Override public void doFile(File aLocalFile, String aRemoteDir) {tSftpPool.submit(aChannelSftp -> {try {aChannelSftp.put(aLocalFile.getPath(), aRemoteDir);} catch (SftpException ignored) {}});}
             @Override public boolean dirFilter(String aLocalDirName) {return !aLocalDirName.startsWith(".") && !aLocalDirName.startsWith("_");}
             @Override public boolean fileFilter(String aLocalFileName) {return !aLocalFileName.startsWith(".") && !aLocalFileName.startsWith("_");}
@@ -635,7 +685,7 @@ public final class ServerSSH {
         return tAttrs != null && !tAttrs.isDir();
     }
     // 在远程服务器创建文件夹，实现跨文件夹创建文件夹。不同于一般的 mkdir，这里如果原本的目录存在会返回 true（主要是为了编程和使用的方便）
-    static boolean mkdir_(ChannelSftp aChannelSftp, String aDir) {
+    static boolean makeDir_(ChannelSftp aChannelSftp, String aDir) {
         if (isDir_(aChannelSftp, aDir)) return true;
         // 如果目录不存在，则需要创建目录
         boolean tSuc = true;
@@ -643,7 +693,7 @@ public final class ServerSSH {
         if (tEndIdx > 0) {
             String tParent = aDir.substring(0, tEndIdx+1);
             // 递归创建上级目录
-            tSuc = mkdir_(aChannelSftp, tParent);
+            tSuc = makeDir_(aChannelSftp, tParent);
         }
         // 创建当前目录
         try {aChannelSftp.mkdir(aDir);} catch (SftpException e) {return false;}
@@ -778,4 +828,6 @@ public final class ServerSSH {
         public List<Runnable> shutdownNow() {return mPool.shutdownNow();}
     }
     
+    // 手动加载 UT，会自动重新设置工作目录，会在调用静态函数 get 或者 load 时自动加载保证路径的正确性
+    static {UT.init();}
 }

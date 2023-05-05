@@ -5,13 +5,14 @@ javaaddpath('include/smartSLURM.jar');
 %% set login parameters
 SSH_USER = 'username';
 SSH_IP = 'hostname';
+SSH_PORT = 22;
 SSH_PASSWORD = 'password';
 SERVER_PROJECT_PATH = '~/test-smartSLURM';
 
 %% SSH PART
 import com.chanzy.*
-% init ssh, local project path and remote project path is needed
-ssh = ServerSSH.get(cd, SERVER_PROJECT_PATH, SSH_USER, SSH_IP, SSH_PASSWORD);
+% init ssh, remote project path is needed
+ssh = ServerSSH.get(SERVER_PROJECT_PATH, SSH_USER, SSH_IP, SSH_PORT, SSH_PASSWORD);
 % put all of this project dir to the server (will exclude file and dir which begin with '.' or '_')
 ssh.putWorkingDir();
 % can mkdir in ssh
@@ -41,8 +42,8 @@ ssh.shutdown();
 
 %% SLURM PART
 import com.chanzy.*
-% init slurm, max job number, local project path and remote project path is needed
-slurm = ServerSLURM.get(4, cd, SERVER_PROJECT_PATH, SSH_USER, SSH_IP, SSH_PASSWORD);
+% init slurm, max job number, remote project path is needed
+slurm = ServerSLURM.get(4, SERVER_PROJECT_PATH, SSH_USER, SSH_IP, SSH_PORT, SSH_PASSWORD);
 % you can get the ssh of this and use the ssh methods before
 ssh = slurm.ssh();
 % use 'submitSystem' to submit command in sbatch mod

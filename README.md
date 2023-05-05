@@ -169,6 +169,7 @@ suc = code.UT.tryTask(task, 3);
 %     if suc; break; end
 % end
 ```
+- 不需要在 task 的指令中出现 `{`，`}`，`:`，`null` 这几个符号，会影响反序列化
 
 
 # 接口说明
@@ -181,11 +182,13 @@ suc = code.UT.tryTask(task, 3);
         - `load(FilePath)`：
         静态方法，从 `FilePath` 加载 ssh 端
     - **获取对象**
-        - `get(LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], [Password])`：
+        - `get([LocalWorkingDir=""], [RemoteWorkingDir=""], Username, Hostname, [Port=22], [Password])`：
         静态方法，获取 ssh 终端并且连接到终端，在不提供密码时会使用密钥登录，默认会使用 `{user.home}/.ssh/id_rsa` 位置的密钥
-        - `getKey(LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], KeyPath)`：
+        - `getKey([LocalWorkingDir=""], [RemoteWorkingDir=""], Username, Hostname, [Port=22], KeyPath)`：
         静态方法，获取 ssh 终端并且连接到终端，使用 `KeyPath` 位置的密钥进行认证，
         **注意 jsch 只支持经典格式的 openSSH 密钥，因此在生成密钥时需要加上 `-m pem` 参数**
+        - `getPassword([LocalWorkingDir=""], [RemoteWorkingDir=""], Username, Hostname, [Port=22], Password)`：
+        静态方法，获取 ssh 终端并且连接到终端，使用密码认证，认为最后一个输入的字符串是密码
     - **参数设置**
         - `setLocalWorkingDir(LocalWorkingDir)`：
         设置本地的工作目录，输入 null 或者空字符串则会设置为系统的用户路径 `System.getProperty("user.home")`
@@ -272,12 +275,14 @@ suc = code.UT.tryTask(task, 3);
         - `setMirror(Path)`：
         设置此对象的本地镜像，之后任何改动都会同步到本地的镜像上。可以通过 `load` 来重新加载这个镜像来继续操作
     - **获取对象**
-        - `get([SqueueName=username], MaxJobNumber, [MaxThisJobNumber=MaxJobNumber], LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], [Password])`：
+        - `get([SqueueName=username], MaxJobNumber, [MaxThisJobNumber=MaxJobNumber], [LocalWorkingDir=""], [RemoteWorkingDir=""], Username, Hostname, [Port=22], [Password])`：
         静态方法，获取 slurm 终端并且连接到终端，
         指定 `MaxJobNumber` 来限制在 SLURM 上同时运行的作业数目，指定 `MaxThisJobNumber` 来限制本对象同时运行的作业个数，
         指定 `SqueueName` 来设置 squeue 时这个用户的名称（部分 SLURM 上和 ssh 登录的用户名不同）
-        - `getKey([SqueueName=username], MaxJobNumber, [MaxThisJobNumber=MaxJobNumber], LocalWorkingDir, RemoteWorkingDir, Username, Hostname, [Port=22], KeyPath)`：
+        - `getKey([SqueueName=username], MaxJobNumber, [MaxThisJobNumber=MaxJobNumber], [LocalWorkingDir=""], [RemoteWorkingDir=""], Username, Hostname, [Port=22], KeyPath)`：
         静态方法，获取 slurm 终端并且连接到终端，使用 `KeyPath` 位置的密钥进行认证
+        - `getPassword([SqueueName=username], MaxJobNumber, [MaxThisJobNumber=MaxJobNumber], [LocalWorkingDir=""], [RemoteWorkingDir=""], Username, Hostname, [Port=22], Password)`：
+        静态方法，获取 slurm 终端并且连接到终端，使用密码认证，认为最后一个输入的字符串是密码
      - **参数设置**
         - `setSleepTime(SleepTime)`：
         设置每轮提交任务或者检测任务完成情况的等待时间，单位 ms，默认为 500
@@ -301,14 +306,14 @@ suc = code.UT.tryTask(task, 3);
         直接杀死这个 slurm 端，类似于通过系统层面直接杀死（但是更加安全可控），会保留内部记录的正在执行的任务以及任务队列，
         在没有设置镜像时执行会提示警告，关闭 `Warning` 可以抑制这个警告
     - **任务提交**
-        - `submitSystem([BeforeSystem], [AfterSystem], Command, [Partition], NodeNumber=1, OutputPath='.temp/slurm/out-%j')`：
+        - `[task_]submitSystem([BeforeSystem], [AfterSystem], Command, [Partition], NodeNumber=1, OutputPath='.temp/slurm/out-%j')`：
         向 SLURM 服务器提交指令，相当于此指令写入了一个 bash 脚本并且使用 sbatch 来提交，
         输入 Task 对象来指定 `BeforeSystem` 和 `AfterSystem`，分别会在执行任务前和完成任务后执行这个 Task
-        - `submitBash([BeforeSystem], [AfterSystem], BashPath, [Partition], NodeNumber=1, OutputPath='.temp/slurm/out-%j')`：
+        - `[task_]submitBash([BeforeSystem], [AfterSystem], BashPath, [Partition], NodeNumber=1, OutputPath='.temp/slurm/out-%j')`：
         向 SLURM 服务器直接提交 bash 脚本，相当于将本地的处于 `BashPath` 的脚本上传到远程服务器，然后使用 sbatch 来提交
-        - `submitSrun([BeforeSystem], [AfterSystem], Command, [Partition], TaskNumber=1, MaxTaskNumberPerNode=20, OutputPath='.temp/slurm/out-%j')`：
+        - `[task_]submitSrun([BeforeSystem], [AfterSystem], Command, [Partition], TaskNumber=1, MaxTaskNumberPerNode=20, OutputPath='.temp/slurm/out-%j')`：
         向 SLURM 服务器直接提交 srun 指令，相当于在指令前增加一个 srun 并且写入 bash 脚本然后用sbatch 来提交，会根据输入自动计算需要的节点数目
-        - `submitSrunBash([BeforeSystem], [AfterSystem], BashPath, [Partition], TaskNumber=1, MaxTaskNumberPerNode=20, OutputPath='.temp/slurm/out-%j')`：
+        - `[task_]submitSrunBash([BeforeSystem], [AfterSystem], BashPath, [Partition], TaskNumber=1, MaxTaskNumberPerNode=20, OutputPath='.temp/slurm/out-%j')`：
         向 SLURM 服务器直接提交 srun 运行的脚本，首先会将本地的处于 `BashPath` 的脚本上传到远程服务器，然后使用 srun 实行这个脚本，
         并且将此操作写入 bash 脚本然后使用 sbatch 来提交，会根据输入自动计算需要的节点数目
     - **实用方法**

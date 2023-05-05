@@ -1,9 +1,15 @@
 package com.chanzy.code;
 
-import java.util.ArrayList;
-import java.util.List;
 import com.chanzy.ServerSLURM;
 import com.chanzy.ServerSSH;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * @author CHanzy
@@ -44,8 +50,10 @@ public class UT {
             , PUT_DIR
             , GET_DIR
             , CLEAR_DIR
-            , RMDIR
-            , MKDIR
+            , REMOVE_DIR
+            , RMDIR // 兼容旧版
+            , MAKE_DIR
+            , MKDIR // 兼容旧版
             , PUT_FILE
             , GET_FILE
             , PUT_DIR_PAR
@@ -58,63 +66,110 @@ public class UT {
             , CLEAR_WORKING_DIR
             , CLEAR_WORKING_DIR_PAR
             // SLURM stuff
-            , CANCEL_ALL
-            , CANCEL_THIS
+            , SLURM_CANCEL_ALL
+            , CANCEL_ALL // 兼容旧版
+            , SLURM_CANCEL_THIS
+            , CANCEL_THIS // 兼容旧版
+            , SLURM_SUBMIT_SYSTEM
+            , SLURM_SUBMIT_BASH
+            , SLURM_SUBMIT_SRUN
+            , SLURM_SUBMIT_SRUN_BASH
         }
-        public static Task fromString(Object aTaskCreator, String aStr) {
+        public static Task fromString(final Object aTaskCreator, String aStr) {
             Pair<String, List<String>> tPair = getKeyValue_(aStr);
-            switch (Type.valueOf(tPair.first)) {
+            Type tKey = Type.valueOf(tPair.first);
+            String[] tValue = tPair.second.toArray(new String[0]);
+            switch (tKey) {
             case MERGE:
-                return mergeTask(fromString(aTaskCreator, tPair.second.get(0)), fromString(aTaskCreator, tPair.second.get(1)));
-            case CANCEL_ALL:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).task_cancelAll()  : null;
-            case CANCEL_THIS:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).task_cancelThis() : null;
+                return mergeTask(fromString(aTaskCreator, tValue[0]), fromString(aTaskCreator, tValue[1]));
+            case SLURM_CANCEL_ALL: case CANCEL_ALL:
+            case SLURM_CANCEL_THIS: case CANCEL_THIS:
+            case SLURM_SUBMIT_SYSTEM: case SLURM_SUBMIT_BASH: case SLURM_SUBMIT_SRUN: case SLURM_SUBMIT_SRUN_BASH:
+                return fromString_(aTaskCreator, (aTaskCreator instanceof ServerSLURM) ? (ServerSLURM)aTaskCreator : null, tKey, tValue);
             case SYSTEM:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_system            (tPair.second.get(0)) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_system     (tPair.second.get(0)) : null;
-            case PUT_DIR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_putDir            (tPair.second.get(0)) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_putDir     (tPair.second.get(0)) : null;
-            case GET_DIR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_getDir            (tPair.second.get(0)) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_getDir     (tPair.second.get(0)) : null;
-            case CLEAR_DIR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_clearDir          (tPair.second.get(0)) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_clearDir   (tPair.second.get(0)) : null;
-            case RMDIR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_rmdir             (tPair.second.get(0)) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_rmdir      (tPair.second.get(0)) : null;
-            case MKDIR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_mkdir             (tPair.second.get(0)) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_mkdir      (tPair.second.get(0)) : null;
-            case PUT_FILE:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_putFile           (tPair.second.get(0)) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_putFile    (tPair.second.get(0)) : null;
-            case GET_FILE:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_getFile           (tPair.second.get(0)) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_getFile    (tPair.second.get(0)) : null;
-            case PUT_DIR_PAR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_putDir            (tPair.second.get(0), Integer.parseInt(tPair.second.get(1))) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_putDir      (tPair.second.get(0), Integer.parseInt(tPair.second.get(1))) : null;
-            case GET_DIR_PAR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_getDir            (tPair.second.get(0), Integer.parseInt(tPair.second.get(1))) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_getDir      (tPair.second.get(0), Integer.parseInt(tPair.second.get(1))) : null;
-            case CLEAR_DIR_PAR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_clearDir          (tPair.second.get(0), Integer.parseInt(tPair.second.get(1))) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_clearDir    (tPair.second.get(0), Integer.parseInt(tPair.second.get(1))) : null;
-            case PUT_WORKING_DIR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_putWorkingDir     () : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_putWorkingDir     () : null;
-            case PUT_WORKING_DIR_PAR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_putWorkingDir     (Integer.parseInt(tPair.second.get(0))) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_putWorkingDir     (Integer.parseInt(tPair.second.get(0))) : null;
-            case GET_WORKING_DIR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_getWorkingDir     () : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_getWorkingDir     () : null;
-            case GET_WORKING_DIR_PAR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_getWorkingDir     (Integer.parseInt(tPair.second.get(0))) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_getWorkingDir     (Integer.parseInt(tPair.second.get(0))) : null;
-            case CLEAR_WORKING_DIR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_clearWorkingDir   () : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_clearWorkingDir   () : null;
-            case CLEAR_WORKING_DIR_PAR:
-                return (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh().task_clearWorkingDir   (Integer.parseInt(tPair.second.get(0))) : (aTaskCreator instanceof ServerSSH) ? ((ServerSSH)aTaskCreator).task_clearWorkingDir   (Integer.parseInt(tPair.second.get(0))) : null;
+            case PUT_DIR:     case GET_DIR:     case CLEAR_DIR:
+            case PUT_DIR_PAR: case GET_DIR_PAR: case CLEAR_DIR_PAR:
+            case REMOVE_DIR:  case RMDIR:
+            case MAKE_DIR:    case MKDIR:
+            case PUT_FILE:    case GET_FILE:
+            case PUT_WORKING_DIR:   case PUT_WORKING_DIR_PAR:
+            case GET_WORKING_DIR:   case GET_WORKING_DIR_PAR:
+            case CLEAR_WORKING_DIR: case CLEAR_WORKING_DIR_PAR:
+                return fromString_(aTaskCreator, (aTaskCreator instanceof ServerSLURM) ? ((ServerSLURM)aTaskCreator).ssh() : (aTaskCreator instanceof ServerSSH) ? (ServerSSH)aTaskCreator : null, tKey, tValue);
             case NULL: default:
                 return null;
             }
         }
         
+        static Task fromString_(final Object aTaskCreator, ServerSLURM aSLURM, Type aKey, String... aValues) {
+            if (aSLURM == null) return null;
+            switch (aKey) {
+            case SLURM_CANCEL_ALL: case CANCEL_ALL:
+                return aSLURM.task_cancelAll();
+            case SLURM_CANCEL_THIS: case CANCEL_THIS:
+                return aSLURM.task_cancelThis();
+            case SLURM_SUBMIT_SYSTEM:
+                return aSLURM.task_submitSystem     (fromString(aTaskCreator, aValues[0]), fromString(aTaskCreator, aValues[1]), aValues[2], aValues[3], Integer.parseInt(aValues[4]), aValues[5]);
+            case SLURM_SUBMIT_BASH:
+                return aSLURM.task_submitBash       (fromString(aTaskCreator, aValues[0]), fromString(aTaskCreator, aValues[1]), aValues[2], aValues[3], Integer.parseInt(aValues[4]), aValues[5]);
+            case SLURM_SUBMIT_SRUN:
+                return aSLURM.task_submitSrun       (fromString(aTaskCreator, aValues[0]), fromString(aTaskCreator, aValues[1]), aValues[2], aValues[3], Integer.parseInt(aValues[4]), Integer.parseInt(aValues[5]), aValues[6]);
+            case SLURM_SUBMIT_SRUN_BASH:
+                return aSLURM.task_submitSrunBash   (fromString(aTaskCreator, aValues[0]), fromString(aTaskCreator, aValues[1]), aValues[2], aValues[3], Integer.parseInt(aValues[4]), Integer.parseInt(aValues[5]), aValues[6]);
+            default:
+                return null;
+            }
+        }
+        
+        static Task fromString_(final Object aTaskCreator, ServerSSH aSSH, Type aKey, String... aValues) {
+            if (aSSH == null) return null;
+            switch (aKey) {
+            case SYSTEM:
+                return aSSH.task_system         (aValues[0]);
+            case PUT_DIR:
+                return aSSH.task_putDir         (aValues[0]);
+            case GET_DIR:
+                return aSSH.task_getDir         (aValues[0]);
+            case CLEAR_DIR:
+                return aSSH.task_clearDir       (aValues[0]);
+            case REMOVE_DIR: case RMDIR:
+                return aSSH.task_rmdir          (aValues[0]);
+            case MAKE_DIR: case MKDIR:
+                return aSSH.task_mkdir          (aValues[0]);
+            case PUT_FILE:
+                return aSSH.task_putFile        (aValues[0]);
+            case GET_FILE:
+                return aSSH.task_getFile        (aValues[0]);
+            case PUT_DIR_PAR:
+                return aSSH.task_putDir         (aValues[0], Integer.parseInt(aValues[1]));
+            case GET_DIR_PAR:
+                return aSSH.task_getDir         (aValues[0], Integer.parseInt(aValues[1]));
+            case CLEAR_DIR_PAR:
+                return aSSH.task_clearDir       (aValues[0], Integer.parseInt(aValues[1]));
+            case PUT_WORKING_DIR:
+                return aSSH.task_putWorkingDir  ();
+            case PUT_WORKING_DIR_PAR:
+                return aSSH.task_putWorkingDir  (Integer.parseInt(aValues[0]));
+            case GET_WORKING_DIR:
+                return aSSH.task_getWorkingDir  ();
+            case GET_WORKING_DIR_PAR:
+                return aSSH.task_getWorkingDir  (Integer.parseInt(aValues[0]));
+            case CLEAR_WORKING_DIR:
+                return aSSH.task_clearWorkingDir();
+            case CLEAR_WORKING_DIR_PAR:
+                return aSSH.task_clearWorkingDir(Integer.parseInt(aValues[0]));
+            default:
+                return null;
+            }
+        }
+        
+        static final List<String> ZL_STR = new ArrayList<>();
         // deserialize the String in formation "Key{value1:value2:...}"
         static Pair<String, List<String>> getKeyValue_(String aStr) {
             int tValueIdx = aStr.indexOf("{");
-            if (tValueIdx < 0) return new Pair<>(aStr, null);
+            if (tValueIdx < 0) return new Pair<>(aStr, ZL_STR);
             String tKey = aStr.substring(0, tValueIdx);
-            List<String> tValue = new ArrayList<>();
+            List<String> tValues = new ArrayList<>();
             // 直接遍历查找，注意在括号内部时不需要分割 :
             ++tValueIdx;
             int tIdx = tValueIdx;
@@ -123,13 +178,16 @@ public class UT {
                 if (aStr.charAt(tIdx)=='{') ++tBlockCounter;
                 if (aStr.charAt(tIdx)=='}') --tBlockCounter;
                 if (tBlockCounter == 1 && aStr.charAt(tIdx)==':') {
-                    tValue.add(aStr.substring(tValueIdx, tIdx));
+                    // 如果是 "null" 字符串则认为是 null
+                    String tValue = aStr.substring(tValueIdx, tIdx);
+                    if (tValue.equals("null")) tValue = null;
+                    tValues.add(tValue);
                     tValueIdx = tIdx + 1;
                 }
-                if (tBlockCounter == 0) tValue.add(aStr.substring(tValueIdx, tIdx)); // 到达最后，最后一项放入 value
+                if (tBlockCounter == 0) tValues.add(aStr.substring(tValueIdx, tIdx)); // 到达最后，最后一项放入 value
                 ++tIdx;
             }
-            return new Pair<>(tKey, tValue);
+            return new Pair<>(tKey, tValues);
         }
     }
     
@@ -177,4 +235,54 @@ public class UT {
         }
         return tSuc;
     }
+    
+    /**
+     * @author CHanzy
+     * use Runtime.exec() to get the working dir
+     * it seems like the only way to get the correct working dir in matlab
+     * return `System.getProperty("user.home")` if failed in exec
+     */
+    public static String pwd() {
+        String wd;
+        try {
+            Process tProcess = Runtime.getRuntime().exec(System.getProperty("os.name").toLowerCase().contains("windows") ? "cmd /c cd" : "pwd");
+            tProcess.waitFor();
+            BufferedReader tReader = new BufferedReader(new InputStreamReader(tProcess.getInputStream()));
+            wd = tReader.readLine().trim();
+        } catch (IOException | InterruptedException e) {
+            wd = System.getProperty("user.home");
+        }
+        return wd;
+    }
+    
+    /**
+     * @author CHanzy
+     * check whether the two paths are actually same
+     * note that `toAbsolutePath` in `Paths` will still not work even used `setProperty`
+     * so I implemented another kind of `toAbsolutePath`
+     */
+    public static boolean samePath(String aPath1, String aPath2) {
+        return WORKING_PATH.resolve(aPath1).normalize().equals(WORKING_PATH.resolve(aPath2).normalize());
+    }
+    
+    /**
+     * @author CHanzy
+     * right `toAbsolutePath` method
+     */
+    public static String toAbsolutePath(String aPath) {
+        return WORKING_PATH.resolve(aPath).toString();
+    }
+    
+    // reset the working dir to correct value
+    private static Path WORKING_PATH;
+    private static boolean INITIALIZED = false;
+    public static void init() {
+        if (INITIALIZED) return;
+        INITIALIZED = true;
+        String wd = pwd();
+        System.setProperty("user.dir", wd);
+        WORKING_PATH = Paths.get(wd);
+    }
+    
+    static {init();}
 }
